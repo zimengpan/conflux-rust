@@ -1517,10 +1517,6 @@ impl SynchronizationProtocolHandler {
                 }
                 Ok(removed_req)
             } else {
-                warn!(
-                    "Unexpected Responce: peer={:?} request_id={:?}",
-                    peer_id, request_id
-                );
                 Err(ErrorKind::UnexpectedResponse.into())
             }
         } else {
@@ -1722,7 +1718,7 @@ impl SynchronizationProtocolHandler {
             }
         }
         for sync_req in timeout_requests {
-            debug!("Timeout sync_req: {:?}", sync_req);
+            warn!("Timeout sync_req: {:?}", sync_req);
             let req =
                 self.match_request(io, sync_req.peer_id, sync_req.request_id);
             match req {
@@ -1732,7 +1728,7 @@ impl SynchronizationProtocolHandler {
                     self.send_request_again(request, io);
                 }
                 Err(e) => {
-                    warn!("match request err={:?}", e);
+                    debug!("Timeout a removed request err={:?}", e);
                 }
             }
         }
@@ -2017,7 +2013,7 @@ impl NetworkProtocolHandler for SynchronizationProtocolHandler {
     fn on_peer_connected(&self, io: &NetworkContext, peer: PeerId) {
         let mut syn = self.syn.write();
 
-        debug!("Peer connected: peer={:?}", peer);
+        info!("Peer connected: peer={:?}", peer);
         if let Err(e) = self.send_status(io, peer) {
             debug!("Error sending status message: {:?}", e);
             io.disconnect_peer(peer);
@@ -2030,10 +2026,14 @@ impl NetworkProtocolHandler for SynchronizationProtocolHandler {
         info!("Peer disconnected: peer={:?}", peer);
         let mut unfinished_requests = Vec::new();
         {
+            let _requests = self.requests_queue.lock();
             let mut syn = self.syn.write();
             if let Some(peer_state) = syn.peers.remove(&peer) {
                 for maybe_req in peer_state.inflight_requests {
                     if let Some(req) = maybe_req {
+                        req.timed_req
+                            .removed
+                            .store(true, AtomicOrdering::Relaxed);
                         unfinished_requests.push(req.message);
                     }
                 }

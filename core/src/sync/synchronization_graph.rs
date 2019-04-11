@@ -36,6 +36,18 @@ const BLOCK_HEADER_PARENTAL_TREE_READY: u8 = 2;
 const BLOCK_HEADER_GRAPH_READY: u8 = 3;
 const BLOCK_GRAPH_READY: u8 = 4;
 
+pub struct SyncGraphStatistics {
+    pub inserted_block_count: usize,
+}
+
+impl SyncGraphStatistics {
+    fn new() -> SyncGraphStatistics {
+        SyncGraphStatistics {
+            inserted_block_count: 0,
+        }
+    }
+}
+
 pub struct BestInformation {
     pub best_block_hash: H256,
     pub current_difficulty: U256,
@@ -70,6 +82,17 @@ pub struct SynchronizationGraphNode {
     /// The minimum epoch number of the block in the view of other
     /// blocks including itself.
     pub min_epoch_in_other_views: u64,
+}
+
+impl SynchronizationGraphNode {
+    pub fn light_difficulty(&self) -> U256 {
+        if self.is_heavy {
+            *self.block_header.difficulty()
+                / U256::from(HEAVY_BLOCK_DIFFICULTY_RATIO)
+        } else {
+            *self.block_header.difficulty()
+        }
+    }
 }
 
 pub struct SynchronizationGraphInner {
@@ -397,14 +420,25 @@ impl SynchronizationGraphInner {
         );
 
         let mut cur = cur_index;
-        let cur_difficulty = *self.arena[cur].block_header.difficulty();
+        let cur_difficulty = self.arena[cur].light_difficulty();
         let mut block_count = 0 as u64;
         let mut max_time = u64::min_value();
         let mut min_time = u64::max_value();
         for _ in 0..self.pow_config.difficulty_adjustment_epoch_period {
-            block_count = block_count
-                + self.arena[cur].blockset_in_own_view_of_epoch.len() as u64
-                + 1;
+            for index in self.arena[cur].blockset_in_own_view_of_epoch.iter() {
+                if self.arena[*index].is_heavy {
+                    block_count += HEAVY_BLOCK_DIFFICULTY_RATIO as u64;
+                } else {
+                    block_count += 1;
+                }
+            }
+
+            if self.arena[cur].is_heavy {
+                block_count += HEAVY_BLOCK_DIFFICULTY_RATIO as u64;
+            } else {
+                block_count += 1;
+            }
+
             max_time = max(max_time, self.arena[cur].block_header.timestamp());
             min_time = min(min_time, self.arena[cur].block_header.timestamp());
             cur = self.arena[cur].parent;
@@ -465,6 +499,7 @@ pub struct SynchronizationGraph {
     pub initial_missed_block_hashes: Mutex<HashSet<H256>>,
     pub verification_config: VerificationConfig,
     pub cache_man: Arc<Mutex<CacheManager<CacheId>>>,
+    pub statistics: RwLock<SyncGraphStatistics>,
 
     /// Channel used to send work to `ConsensusGraph`
     consensus_sender: Mutex<Sender<H256>>,
@@ -503,6 +538,7 @@ impl SynchronizationGraph {
             verification_config,
             cache_man: consensus.cache_man.clone(),
             consensus: consensus.clone(),
+            statistics: RwLock::new(SyncGraphStatistics::new()),
             consensus_sender: Mutex::new(consensus_sender),
         };
 
@@ -537,6 +573,7 @@ impl SynchronizationGraph {
                     rlp.as_list::<H256>().expect("Failed to decode terminals!")
                 }
                 None => {
+                    info!("No terminals got from db");
                     return;
                 }
             };
@@ -602,6 +639,7 @@ impl SynchronizationGraph {
                     rlp.as_list::<H256>().expect("Failed to decode terminals!")
                 }
                 None => {
+                    info!("No terminals got from db");
                     return;
                 }
             };
@@ -983,6 +1021,8 @@ impl SynchronizationGraph {
             return (insert_success, need_to_relay);
         }
 
+        self.stat_inc_inserted_count();
+
         let me = *inner.indices.get(&hash).unwrap();
         debug_assert!(hash == inner.arena[me].block_header.hash());
         debug_assert!(!inner.arena[me].block_ready);
@@ -1149,6 +1189,11 @@ impl SynchronizationGraph {
             unexecuted_transaction_addresses.len()
         );
 
+        info!(
+            "Synchronization graph- inserted block count: {}",
+            self.stat_get_inserted_count()
+        );
+
         cache_man.collect_garbage(current_size, |ids| {
             for id in &ids {
                 match *id {
@@ -1189,5 +1234,16 @@ impl SynchronizationGraph {
                 + unexecuted_transaction_addresses.heap_size_of_children()
                 + compact_blocks.heap_size_of_children()
         });
+    }
+
+    // Manage statistics
+
+    pub fn stat_inc_inserted_count(&self) {
+        let mut stat = self.statistics.write();
+        stat.inserted_block_count += 1;
+    }
+
+    pub fn stat_get_inserted_count(&self) -> usize {
+        self.statistics.read().inserted_block_count
     }
 }

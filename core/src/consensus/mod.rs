@@ -12,6 +12,7 @@ use crate::{
     pow::ProofOfWorkConfig,
     state::{CleanupMode, State},
     statedb::StateDb,
+    statistics::SharedStatistics,
     storage::{state::StateTrait, StorageManager, StorageManagerTrait},
     sync::SynchronizationGraphInner,
     transaction_pool::SharedTransactionPool,
@@ -21,7 +22,8 @@ use crate::{
 };
 use cfx_types::{Address, Bloom, H160, H256, U256, U512};
 use heapsize::HeapSizeOf;
-use link_cut_tree::LinkCutTree;
+use link_cut_tree::{LinkCutTree, SignedBigNum};
+use monitor::Monitor;
 use parking_lot::{Mutex, RwLock};
 use primitives::{
     filter::{Filter, FilterError},
@@ -68,6 +70,19 @@ const EPOCH_LIMIT_OF_RELATED_TRANSACTIONS: usize = 100;
 
 const BLOCK_STATUS_SUFFIX_BYTE: u8 = 1;
 
+#[derive(Debug)]
+pub struct ConsensusGraphStatistics {
+    pub inserted_block_count: usize,
+}
+
+impl ConsensusGraphStatistics {
+    pub fn new() -> ConsensusGraphStatistics {
+        ConsensusGraphStatistics {
+            inserted_block_count: 0,
+        }
+    }
+}
+
 pub struct ConsensusGraphNodeData {
     pub epoch_number: RefCell<usize>,
     pub partial_invalid: bool,
@@ -113,7 +128,6 @@ pub struct ConsensusGraphInner {
     genesis_block_index: usize,
     genesis_block_state_root: H256,
     genesis_block_receipts_root: H256,
-    parental_terminals: HashSet<usize>,
     indices_in_epochs: HashMap<usize, Vec<usize>>,
     vm: VmFactory,
     weight_tree: LinkCutTree,
@@ -149,7 +163,6 @@ impl ConsensusGraphInner {
                 .block_header
                 .deferred_receipts_root()
                 .clone(),
-            parental_terminals: HashSet::new(),
             indices_in_epochs: HashMap::new(),
             vm,
             weight_tree: LinkCutTree::new(),
@@ -167,19 +180,19 @@ impl ConsensusGraphInner {
         // so we cannot compute its past_difficulty from
         // sync_graph.total_difficulty_in_own_epoch().
         // For genesis block, its past_difficulty is simply its own difficulty.
-        inner.genesis_block_index = inner
+        let (genesis_index, _) = inner
             .insert(genesis_block, *genesis_block.block_header.difficulty());
+        inner.genesis_block_index = genesis_index;
         inner.weight_tree.make_tree(inner.genesis_block_index);
         inner.weight_tree.update_weight(
             inner.genesis_block_index,
-            genesis_block.block_header.difficulty(),
+            &SignedBigNum::pos(*genesis_block.block_header.difficulty()),
         );
         *inner.arena[inner.genesis_block_index]
             .data
             .epoch_number
             .borrow_mut() = 0;
         inner.pivot_chain.push(inner.genesis_block_index);
-        inner.parental_terminals.insert(inner.genesis_block_index);
         assert!(inner.genesis_block_receipts_root == KECCAK_EMPTY_LIST_RLP);
         inner.block_receipts_root.insert(
             inner.genesis_block_index,
@@ -283,7 +296,9 @@ impl ConsensusGraphInner {
         false
     }
 
-    pub fn insert(&mut self, block: &Block, past_difficulty: U256) -> usize {
+    pub fn insert(
+        &mut self, block: &Block, past_difficulty: U256,
+    ) -> (usize, usize) {
         let hash = block.hash();
 
         let parent = if *block.block_header.parent_hash() != H256::default() {
@@ -318,11 +333,9 @@ impl ConsensusGraphInner {
         self.indices.insert(hash, index);
 
         if parent != NULL {
-            self.parental_terminals.remove(&parent);
             self.terminal_hashes.remove(&self.arena[parent].hash);
             self.arena[parent].children.push(index);
         }
-        self.parental_terminals.insert(index);
         self.terminal_hashes.insert(hash);
         let referees = self.arena[index].referees.clone();
         for referee in referees {
@@ -333,7 +346,7 @@ impl ConsensusGraphInner {
             hash, index, past_difficulty
         );
 
-        index
+        (index, self.indices.len())
     }
 
     pub fn epoch_executed(&mut self, epoch_index: usize) -> bool {
@@ -376,141 +389,75 @@ impl ConsensusGraphInner {
         sync_graph: &SynchronizationGraphInner,
     ) -> bool
     {
-        struct ForkPointInfo {
-            pivot_index: usize,
-            fork_total_difficulty: U256,
-        }
-
         let me_in_sync = *sync_graph
             .indices
             .get(&self.arena[me_in_consensus].hash)
             .unwrap();
 
-        let mut fork_points: HashMap<usize, ForkPointInfo> = HashMap::new();
-        let mut pivot_points: HashMap<usize, U256> = HashMap::new();
-        let mut min_fork_height = u64::max_value();
-
         let anticone = &self.arena[me_in_consensus].data.anticone;
 
-        // Avoid unnecessarily following pathes that result in the same fork
-        // points.
-        let mut visited_indices = HashSet::new();
+        let mut valid = true;
+        let parent = self.arena[me_in_consensus].parent;
 
-        // Given that the parent of `me` is checked, we just need to check the
-        // fork points whose difficulty are affected by blocks in this
-        // new epoch.
-        'outer: for sync_index in
-            &sync_graph.arena[me_in_sync].blockset_in_own_view_of_epoch
-        {
-            let mut fork = *self
-                .indices
-                .get(&sync_graph.arena[*sync_index].block_header.hash())
-                .expect("In consensus graph");
-            visited_indices.insert(fork);
-            let mut me = me_in_consensus;
-            while self.arena[me].height > self.arena[fork].height {
-                me = self.arena[me].parent;
-            }
-            if me == fork {
-                //FIXME: Maybe we should treat this as invalid block.
-                continue;
-            }
-            while self.arena[fork].height > self.arena[me].height {
-                fork = self.arena[fork].parent;
-                if visited_indices.contains(&fork) {
-                    continue 'outer;
-                }
-            }
-            debug_assert!(fork != me);
-            let mut prev_fork = NULL;
-            let mut prev_me = NULL;
-            while fork != me {
-                prev_fork = fork;
-                prev_me = me;
-                debug_assert!(self.arena[fork].height == self.arena[me].height);
-                fork = self.arena[fork].parent;
-                me = self.arena[me].parent;
-                if visited_indices.contains(&fork) {
-                    continue 'outer;
-                }
-            }
-            fork_points.entry(prev_fork).or_insert(ForkPointInfo {
-                pivot_index: prev_me,
-                fork_total_difficulty: self
-                    .weight_tree
-                    .subtree_weight(prev_fork),
-            });
-
-            // `prev_me` can be equal to `me_in_consensus` if the block is
-            // malicously constructed,
-            // which may cause index out of bound error here because it has not
-            // been inserted to weight_tree
-            let prev_me_weight = if prev_me != me_in_consensus {
-                self.weight_tree.subtree_weight(prev_me)
-            } else {
-                0.into()
-            };
-            pivot_points.entry(prev_me).or_insert(prev_me_weight);
-
-            min_fork_height = min(min_fork_height, self.arena[prev_me].height);
-        }
-        debug!(
-            "Get {} fork_points, {} pivot_points",
-            fork_points.len(),
-            pivot_points.len()
-        );
-
-        if fork_points.is_empty() {
-            debug_assert!(pivot_points.is_empty());
-            return true;
-        }
-
-        // Remove difficulty contribution of anticone for fork points
+        // Remove difficulty contribution of anticone
         for index in anticone {
             if self.arena[*index].data.partial_invalid {
                 continue;
             }
             let difficulty = self.arena[*index].difficulty;
-            let mut upper = self.arena[*index].parent;
-            debug_assert!(upper != NULL);
-            loop {
-                if self.arena[upper].height < min_fork_height {
-                    break;
-                }
-
-                if let Some(fork_info) = fork_points.get_mut(&upper) {
-                    debug_assert!(!pivot_points.contains_key(&upper));
-                    fork_info.fork_total_difficulty -= difficulty;
-                    break;
-                } else if pivot_points.contains_key(&upper) {
-                    let height = self.arena[upper].height;
-                    for (pivot_index, pivot_total_difficulty) in
-                        pivot_points.iter_mut()
-                    {
-                        if self.arena[*pivot_index].height <= height {
-                            *pivot_total_difficulty -= difficulty;
-                        }
-                    }
-                    break;
-                }
-                upper = self.arena[upper].parent;
-            }
+            self.weight_tree
+                .update_weight(*index, &SignedBigNum::neg(difficulty));
         }
-        debug!("Finish difficulty contribution removal");
 
         // Check the pivot selection decision.
-        for (index, fork_info) in fork_points {
-            if (fork_info.fork_total_difficulty, self.arena[index].hash)
-                > (
-                    pivot_points.get(&fork_info.pivot_index).unwrap().clone(),
-                    self.arena[fork_info.pivot_index].hash,
+        for sync_index_in_epoch in
+            &sync_graph.arena[me_in_sync].blockset_in_own_view_of_epoch
+        {
+            let consensus_index_in_epoch = *self
+                .indices
+                .get(
+                    &sync_graph.arena[*sync_index_in_epoch].block_header.hash(),
                 )
+                .expect("In consensus graph");
+
+            let lca = self.weight_tree.lca(consensus_index_in_epoch, parent);
+            assert!(lca != consensus_index_in_epoch);
+            if lca == parent {
+                valid = false;
+                break;
+            }
+
+            let fork = self.weight_tree.ancestor_at(
+                consensus_index_in_epoch,
+                self.arena[lca].height as usize + 1,
+            );
+            let pivot = self
+                .weight_tree
+                .ancestor_at(parent, self.arena[lca].height as usize + 1);
+
+            let fork_subtree_weight = self.weight_tree.subtree_weight(fork);
+            let pivot_subtree_weight = self.weight_tree.subtree_weight(pivot);
+
+            if (fork_subtree_weight > pivot_subtree_weight)
+                || ((fork_subtree_weight == pivot_subtree_weight)
+                    && (self.arena[fork].hash > self.arena[pivot].hash))
             {
-                return false;
+                valid = false;
+                break;
             }
         }
 
-        true
+        // Add back difficulty contribution of anticone
+        for index in anticone {
+            if self.arena[*index].data.partial_invalid {
+                continue;
+            }
+            let difficulty = self.arena[*index].difficulty;
+            self.weight_tree
+                .update_weight(*index, &SignedBigNum::pos(difficulty));
+        }
+
+        valid
     }
 
     pub fn compute_anticone(&mut self, me: usize) {
@@ -1478,7 +1425,7 @@ impl ConsensusGraphInner {
         &self, pivot_hash: &H256, epoch: usize,
     ) -> Result<(), String> {
         let last_number = self
-            .get_height_from_epoch_number(EpochNumber::LatestState)
+            .get_height_from_epoch_number(EpochNumber::LatestMined)
             .unwrap();
         let hash =
             self.get_hash_from_epoch_number(EpochNumber::Number(epoch.into()))?;
@@ -1517,14 +1464,14 @@ impl ConsensusGraphInner {
     }
 
     pub fn persist_terminals(&self) {
-        let mut terminals = Vec::with_capacity(self.parental_terminals.len());
-        for index in &self.parental_terminals {
-            terminals.push(self.arena[*index].hash);
+        let mut terminals = Vec::with_capacity(self.terminal_hashes.len());
+        for h in &self.terminal_hashes {
+            terminals.push(h);
         }
         let mut rlp_stream = RlpStream::new();
         rlp_stream.begin_list(terminals.len());
         for hash in terminals {
-            rlp_stream.append(&hash);
+            rlp_stream.append(hash);
         }
         let mut dbops = self.db.key_value().transaction();
         dbops.put(COL_MISC, b"terminals", &rlp_stream.drain());
@@ -1545,6 +1492,7 @@ pub struct ConsensusGraph {
     pub cache_man: Arc<Mutex<CacheManager<CacheId>>>,
     pub invalid_blocks: RwLock<HashSet<H256>>,
     storage_manager: Arc<StorageManager>,
+    pub statistics: SharedStatistics,
 }
 
 pub type SharedConsensusGraph = Arc<ConsensusGraph>;
@@ -1552,7 +1500,8 @@ pub type SharedConsensusGraph = Arc<ConsensusGraph>;
 impl ConsensusGraph {
     pub fn with_genesis_block(
         genesis_block: Block, storage_manager: Arc<StorageManager>,
-        vm: VmFactory, txpool: SharedTransactionPool, db: Arc<SystemDB>,
+        vm: VmFactory, txpool: SharedTransactionPool,
+        statistics: SharedStatistics, db: Arc<SystemDB>,
         cache_man: Arc<Mutex<CacheManager<CacheId>>>,
         pow_config: ProofOfWorkConfig,
     ) -> Self
@@ -1574,6 +1523,7 @@ impl ConsensusGraph {
             cache_man,
             invalid_blocks: RwLock::new(HashSet::new()),
             storage_manager,
+            statistics,
         };
 
         let genesis = consensus_graph.genesis_block();
@@ -2484,7 +2434,9 @@ impl ConsensusGraph {
         let past_difficulty =
             inner.arena[parent_idx].past_difficulty + difficulty_in_my_epoch;
 
-        let me = inner.insert(block.as_ref(), past_difficulty);
+        let (me, indices_len) = inner.insert(block.as_ref(), past_difficulty);
+        self.statistics
+            .set_consensus_graph_inserted_block_count(indices_len);
         inner.compute_anticone(me);
         let fully_valid =
             if let Some(partial_invalid) = self.block_status_from_db(hash) {
@@ -2520,9 +2472,10 @@ impl ConsensusGraph {
 
         inner.weight_tree.make_tree(me);
         inner.weight_tree.link(inner.arena[me].parent, me);
-        inner
-            .weight_tree
-            .update_weight(me, block.block_header.difficulty());
+        inner.weight_tree.update_weight(
+            me,
+            &SignedBigNum::pos(*block.block_header.difficulty()),
+        );
     }
 
     pub fn on_new_block(
@@ -2530,10 +2483,11 @@ impl ConsensusGraph {
     ) {
         let block = self.block_by_hash(hash, true).unwrap();
 
-        info!(
-            "insert new block into consensus: block_header={:?} tx_count={}",
+        debug!(
+            "insert new block into consensus: block_header={:?} tx_count={}, block_size={}",
             block.block_header,
             block.transactions.len(),
+            block.size(),
         );
 
         {
@@ -2584,7 +2538,9 @@ impl ConsensusGraph {
         let past_difficulty =
             inner.arena[parent_idx].past_difficulty + difficulty_in_my_epoch;
 
-        let me = inner.insert(block.as_ref(), past_difficulty);
+        let (me, indices_len) = inner.insert(block.as_ref(), past_difficulty);
+        self.statistics
+            .set_consensus_graph_inserted_block_count(indices_len);
         inner.compute_anticone(me);
 
         let fully_valid = self.check_block_full_validity(
@@ -2602,9 +2558,10 @@ impl ConsensusGraph {
 
         inner.weight_tree.make_tree(me);
         inner.weight_tree.link(inner.arena[me].parent, me);
-        inner
-            .weight_tree
-            .update_weight(me, block.block_header.difficulty());
+        inner.weight_tree.update_weight(
+            me,
+            &SignedBigNum::pos(*block.block_header.difficulty()),
+        );
 
         let last = inner.pivot_chain.last().cloned().unwrap();
         // TODO: constructing new_pivot_chain without cloning!
@@ -2776,6 +2733,16 @@ impl ConsensusGraph {
         );
         inner.pivot_chain = new_pivot_chain;
         inner.persist_terminals();
+
+        // update latest state of pivot chain into monitor
+        let mut state_epoch_number: usize = 0;
+        if inner.pivot_chain.len() > DEFERRED_STATE_EPOCH_COUNT as usize {
+            state_epoch_number =
+                inner.pivot_chain.len() - DEFERRED_STATE_EPOCH_COUNT as usize;
+        };
+        let state_hash =
+            inner.arena[inner.pivot_chain[state_epoch_number]].hash;
+        Monitor::update_state(state_epoch_number, &state_hash);
     }
 
     pub fn best_block_hash(&self) -> H256 {

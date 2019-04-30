@@ -14,6 +14,7 @@ primitives = { path = "../primitives" }
 parking_lot = "0.6"
 network = { path = "../network" }
 io = { path = "../util/io" }
+monitor = { path = "../util/monitor" }
 log = "0.3"
 rlp = "0.3.0"
 lazy_static = "1.1.0"
@@ -38,6 +39,8 @@ lru = "0.1.11"
 threadpool = "1.0"
 rayon = "1.0"
 link-cut-tree = { path = "../util/link-cut-tree" }
+priority-send-queue = { path = "../util/priority-send-queue" }
+toml = "0.4"
 
 [dev-dependencies]
 rustc-hex = "1.0"

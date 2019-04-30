@@ -9,7 +9,7 @@ use crate::{
     node_database::NodeDatabase,
     node_table::*,
     session::{self, Session, SessionData},
-    Capability, DisconnectReason, Error, IpFilter, NetworkConfiguration,
+    Capability, Error, HandlerWorkType, IpFilter, NetworkConfiguration,
     NetworkContext as NetworkContextTrait, NetworkIoMessage,
     NetworkProtocolHandler, PeerId, PeerInfo, ProtocolId,
 };
@@ -19,6 +19,7 @@ use keylib::{sign, Generator, KeyPair, Random, Secret};
 use mio::{deprecated::EventLoop, tcp::*, udp::*, *};
 use parity_path::restrict_permissions_owner;
 use parking_lot::{Mutex, RwLock};
+use priority_send_queue::SendQueuePriority;
 use std::{
     cmp::{min, Ordering},
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
@@ -311,18 +312,14 @@ impl DelayedQueue {
 
     fn send_delayed_messages(&self, network_service: &NetworkServiceInner) {
         let context = self.queue.lock().pop().unwrap();
-        if context
-            .session
-            .write()
-            .send_packet(
-                &context.io,
-                Some(context.protocol),
-                session::PACKET_USER,
-                &context.msg,
-            )
-            .is_err()
-        {
-            debug!("Error sending delayed message");
+        if let Err(e) = context.session.write().send_packet(
+            &context.io,
+            Some(context.protocol),
+            session::PACKET_USER,
+            &context.msg,
+            context.priority,
+        ) {
+            debug!("Error sending delayed message: {:?}", e);
             network_service.kill_connection(context.peer, &context.io, true);
         };
     }
@@ -1253,16 +1250,19 @@ impl IoHandler<NetworkIoMessage> for NetworkServiceInner {
                         debug!("Error registering timer {}: {:?}", token, e)
                     });
             }
-            NetworkIoMessage::Disconnect(ref peer) => {
-                let session = self.sessions.read().get(*peer).cloned();
-                if let Some(session) = session {
-                    session
-                        .write()
-                        .disconnect(io, DisconnectReason::DisconnectRequested);
+            NetworkIoMessage::DispatchWork {
+                ref protocol,
+                ref work_type,
+            } => {
+                if let Some(handler) = self.handlers.read().get(protocol) {
+                    handler.on_work_dispatch(
+                        &NetworkContext::new(io, *protocol, self),
+                        *work_type,
+                    );
+                } else {
+                    warn!("Work is dispatched to unknown handler");
                 }
-                trace!(target: "network", "Disconnect requested {}", peer);
-                self.kill_connection(*peer, io, false);
-            } //_ => {}
+            }
         }
     }
 
@@ -1385,12 +1385,14 @@ struct DelayMessageContext {
     session: SharedSession,
     peer: PeerId,
     msg: Vec<u8>,
+    priority: SendQueuePriority,
 }
 
 impl DelayMessageContext {
     pub fn new(
         ts: Instant, io: IoContext<NetworkIoMessage>, protocol: ProtocolId,
         session: SharedSession, peer: PeerId, msg: Vec<u8>,
+        priority: SendQueuePriority,
     ) -> Self
     {
         DelayMessageContext {
@@ -1400,6 +1402,7 @@ impl DelayMessageContext {
             session,
             peer,
             msg,
+            priority,
         }
     }
 }
@@ -1445,7 +1448,9 @@ impl<'a> NetworkContextTrait for NetworkContext<'a> {
         self.network_service.get_peer_node_id(peer)
     }
 
-    fn send(&self, peer: PeerId, msg: Vec<u8>) -> Result<(), Error> {
+    fn send(
+        &self, peer: PeerId, msg: Vec<u8>, priority: SendQueuePriority,
+    ) -> Result<(), Error> {
         let sessions = self.network_service.sessions.read();
         let session = sessions.get(peer);
         trace!(target: "network", "Sending {} bytes to {}", msg.len(), peer);
@@ -1475,6 +1480,7 @@ impl<'a> NetworkContextTrait for NetworkContext<'a> {
                         (*session).clone(),
                         peer,
                         msg,
+                        priority,
                     ));
                     self.io.register_timer_once_nocancel(
                         SEND_DELAYED_MESSAGES,
@@ -1488,6 +1494,7 @@ impl<'a> NetworkContextTrait for NetworkContext<'a> {
                         Some(self.protocol),
                         session::PACKET_USER,
                         &msg,
+                        priority,
                     )?;
                 }
             }
@@ -1513,6 +1520,15 @@ impl<'a> NetworkContextTrait for NetworkContext<'a> {
                 warn!("Error sending network IO message: {:?}", e)
             });
         Ok(())
+    }
+
+    fn dispatch_work(&self, work_type: HandlerWorkType) {
+        self.io
+            .message(NetworkIoMessage::DispatchWork {
+                protocol: self.protocol,
+                work_type,
+            })
+            .expect("Error sending network IO message");
     }
 }
 
@@ -1545,7 +1561,7 @@ fn load_key(path: &Path) -> Option<Secret> {
     let mut file = match fs::File::open(path_buf.as_path()) {
         Ok(file) => file,
         Err(e) => {
-            debug!("Error opening key file: {:?}", e);
+            debug!("failed to open key file: {:?}", e);
             return None;
         }
     };

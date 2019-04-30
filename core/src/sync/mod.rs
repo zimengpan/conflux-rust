@@ -11,8 +11,9 @@ mod synchronization_state;
 pub use self::{
     error::{Error, ErrorKind},
     synchronization_graph::{
-        BestInformation, SharedSynchronizationGraph, SynchronizationGraph,
-        SynchronizationGraphInner, SynchronizationGraphNode,
+        BestInformation, SharedSynchronizationGraph, SyncGraphStatistics,
+        SynchronizationGraph, SynchronizationGraphInner,
+        SynchronizationGraphNode,
     },
     synchronization_protocol_handler::{
         ProtocolConfiguration, SynchronizationProtocolHandler,
@@ -22,10 +23,7 @@ pub use self::{
         SharedSynchronizationService, SynchronizationConfiguration,
         SynchronizationService,
     },
-    synchronization_state::{
-        SynchronizationPeerState, SynchronizationState,
-        MAX_INFLIGHT_REQUEST_COUNT,
-    },
+    synchronization_state::{SynchronizationPeerState, SynchronizationState},
 };
 
 pub mod random {

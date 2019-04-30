@@ -35,6 +35,7 @@ build_config! {
         (jsonrpc_http_port, (Option<u16>), None)
         (jsonrpc_cors, (Option<String>), None)
         (jsonrpc_http_keep_alive, (bool), false)
+        (genesis_accounts, (Option<String>), None)
         (log_conf, (Option<String>), None)
         (log_file, (Option<String>), None)
         (bootnodes, (Option<String>), None)
@@ -63,6 +64,7 @@ build_config! {
         (persist_terminal_period_ms, (u64), 60_000)
         (headers_request_timeout_ms, (u64), 30_000)
         (blocks_request_timeout_ms, (u64), 120_000)
+        (max_inflight_request_count, (u64), 32)
         (load_test_chain, (Option<String>), None)
         (start_mining, (bool), false)
         (initial_difficulty, (Option<u64>), None)
@@ -72,6 +74,11 @@ build_config! {
         (egress_min_throttle, (usize), 10)
         (egress_max_throttle, (usize), 64)
         (p2p_nodes_per_ip, (usize), 1)
+        (monitor_host, (Option<String>), None)
+        (monitor_db, (Option<String>), None)
+        (monitor_username, (Option<String>), None)
+        (monitor_password, (Option<String>), None)
+        (monitor_node, (Option<String>), None)
     }
     {
         (
@@ -234,6 +241,9 @@ impl Configuration {
             blocks_request_timeout: Duration::from_millis(
                 self.raw_conf.blocks_request_timeout_ms,
             ),
+            max_inflight_request_count: self
+                .raw_conf
+                .max_inflight_request_count,
         }
     }
 

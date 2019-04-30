@@ -23,10 +23,10 @@ use self::{http::Server as HttpServer, tcp::Server as TcpServer};
 pub use crate::configuration::Configuration;
 use blockgen::BlockGenerator;
 use cfxcore::{
-    cache_manager::CacheManager, pow::WORKER_COMPUTATION_PARALLELISM,
-    storage::StorageManager, transaction_pool::DEFAULT_MAX_BLOCK_GAS_LIMIT,
-    vm_factory::VmFactory, ConsensusGraph, SynchronizationService,
-    TransactionPool,
+    cache_manager::CacheManager, genesis, pow::WORKER_COMPUTATION_PARALLELISM,
+    statistics::Statistics, storage::StorageManager,
+    transaction_pool::DEFAULT_MAX_BLOCK_GAS_LIMIT, vm_factory::VmFactory,
+    ConsensusGraph, SynchronizationService, TransactionPool,
 };
 
 use crate::rpc::{
@@ -35,6 +35,7 @@ use crate::rpc::{
 use cfx_types::Address;
 use ctrlc::CtrlC;
 use db::SystemDB;
+use monitor::Monitor;
 use parking_lot::{Condvar, Mutex};
 use primitives::Block;
 use secret_store::SecretStore;
@@ -54,7 +55,7 @@ use txgen::TransactionGenerator;
 /// Used in Genesis author to indicate testnet version
 /// Increase by one for every test net reset
 const TESTNET_VERSION: &'static str =
-    "0000000000000000000000000000000000000001";
+    "0000000000000000000000000000000000000002";
 
 pub struct ClientHandle {
     pub debug_rpc_http_server: Option<HttpServer>,
@@ -142,8 +143,17 @@ impl Client {
             });
         }
 
+        let genesis_accounts = if conf.raw_conf.test_mode {
+            match conf.raw_conf.genesis_accounts {
+                Some(ref file) => genesis::load_file(file)?,
+                None => genesis::default(secret_store.as_ref()),
+            }
+        } else {
+            genesis::default(secret_store.as_ref())
+        };
+
         let genesis_block = storage_manager.initialize(
-            secret_store.as_ref(),
+            genesis_accounts,
             DEFAULT_MAX_BLOCK_GAS_LIMIT.into(),
             TESTNET_VERSION.into(),
         );
@@ -166,6 +176,8 @@ impl Client {
             cache_man.clone(),
         ));
 
+        let statistics = Arc::new(Statistics::new());
+
         let vm = VmFactory::new(1024 * 32);
         let pow_config = conf.pow_config();
         let consensus = Arc::new(ConsensusGraph::with_genesis_block(
@@ -173,6 +185,7 @@ impl Client {
             storage_manager.clone(),
             vm.clone(),
             txpool.clone(),
+            statistics.clone(),
             ledger_db.clone(),
             cache_man.clone(),
             pow_config.clone(),
@@ -311,6 +324,15 @@ impl Client {
             },
         )?;
 
+        // initialize Monitor
+        Monitor::init(
+            conf.raw_conf.monitor_host,
+            conf.raw_conf.monitor_db,
+            conf.raw_conf.monitor_username,
+            conf.raw_conf.monitor_password,
+            conf.raw_conf.monitor_node,
+        );
+
         Ok(ClientHandle {
             ledger_db: Arc::downgrade(&ledger_db),
             debug_rpc_http_server,
@@ -351,6 +373,9 @@ impl Client {
         BlockGenerator::stop(&blockgen);
         drop(blockgen);
         drop(to_drop);
+
+        // Stop Monitor
+        Monitor::stop();
 
         // Make sure ledger_db is properly dropped, so rocksdb can be closed
         // cleanly

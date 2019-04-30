@@ -33,6 +33,7 @@ extern crate strum_macros;
 extern crate keccak_hash;
 
 pub type ProtocolId = [u8; 3];
+pub type HandlerWorkType = u8;
 pub type PeerId = usize;
 
 mod connection;
@@ -62,6 +63,7 @@ use crate::{
 };
 use ipnetwork::{IpNetwork, IpNetworkError};
 use keylib::Secret;
+use priority_send_queue::SendQueuePriority;
 use rlp::{Decodable, DecoderError, Encodable, Rlp, RlpStream};
 use std::{
     cmp::Ordering,
@@ -185,8 +187,12 @@ pub enum NetworkIoMessage {
         /// Timer delay.
         delay: Duration,
     },
-    /// Disconnect a peer.
-    Disconnect(PeerId),
+    DispatchWork {
+        /// Protocol Id.
+        protocol: ProtocolId,
+        /// Work type.
+        work_type: HandlerWorkType,
+    },
 }
 
 pub trait NetworkProtocolHandler: Sync + Send {
@@ -199,12 +205,16 @@ pub trait NetworkProtocolHandler: Sync + Send {
     fn on_peer_disconnected(&self, io: &NetworkContext, peer: PeerId);
 
     fn on_timeout(&self, io: &NetworkContext, timer: TimerToken);
+
+    fn on_work_dispatch(&self, io: &NetworkContext, work_type: HandlerWorkType);
 }
 
 pub trait NetworkContext {
     fn get_peer_node_id(&self, peer: PeerId) -> NodeId;
 
-    fn send(&self, peer: PeerId, msg: Vec<u8>) -> Result<(), Error>;
+    fn send(
+        &self, peer: PeerId, msg: Vec<u8>, priority: SendQueuePriority,
+    ) -> Result<(), Error>;
 
     fn disconnect_peer(&self, peer: PeerId);
 
@@ -213,6 +223,8 @@ pub trait NetworkContext {
     fn register_timer(
         &self, token: TimerToken, delay: Duration,
     ) -> Result<(), Error>;
+
+    fn dispatch_work(&self, work_type: HandlerWorkType);
 }
 
 #[derive(Debug, Clone)]

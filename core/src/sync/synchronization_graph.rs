@@ -9,6 +9,7 @@ use crate::{
     error::{BlockError, Error, ErrorKind},
     machine::new_machine,
     pow::ProofOfWorkConfig,
+    statistics::SharedStatistics,
     verification::*,
 };
 use cfx_types::{H256, U256, U512};
@@ -36,12 +37,13 @@ const BLOCK_HEADER_PARENTAL_TREE_READY: u8 = 2;
 const BLOCK_HEADER_GRAPH_READY: u8 = 3;
 const BLOCK_GRAPH_READY: u8 = 4;
 
+#[derive(Debug)]
 pub struct SyncGraphStatistics {
     pub inserted_block_count: usize,
 }
 
 impl SyncGraphStatistics {
-    fn new() -> SyncGraphStatistics {
+    pub fn new() -> SyncGraphStatistics {
         SyncGraphStatistics {
             inserted_block_count: 0,
         }
@@ -499,7 +501,7 @@ pub struct SynchronizationGraph {
     pub initial_missed_block_hashes: Mutex<HashSet<H256>>,
     pub verification_config: VerificationConfig,
     pub cache_man: Arc<Mutex<CacheManager<CacheId>>>,
-    pub statistics: RwLock<SyncGraphStatistics>,
+    pub statistics: SharedStatistics,
 
     /// Channel used to send work to `ConsensusGraph`
     consensus_sender: Mutex<Sender<H256>>,
@@ -538,7 +540,7 @@ impl SynchronizationGraph {
             verification_config,
             cache_man: consensus.cache_man.clone(),
             consensus: consensus.clone(),
-            statistics: RwLock::new(SyncGraphStatistics::new()),
+            statistics: consensus.statistics.clone(),
             consensus_sender: Mutex::new(consensus_sender),
         };
 
@@ -1025,7 +1027,7 @@ impl SynchronizationGraph {
             return (insert_success, need_to_relay);
         }
 
-        self.stat_inc_inserted_count();
+        self.statistics.set_sync_graph_inserted_block_count(inner.indices.len());
 
         let me = *inner.indices.get(&hash).unwrap();
         debug_assert!(hash == inner.arena[me].block_header.hash());
@@ -1066,7 +1068,7 @@ impl SynchronizationGraph {
                 // Here we always build a new compact block because we should
                 // not reuse the nonce
                 self.insert_compact_block(block.to_compact());
-                self.insert_block_to_kv(block, persistent);
+                self.insert_block_to_kv(block.clone(), persistent);
             }
         } else {
             insert_success = false;
@@ -1117,6 +1119,13 @@ impl SynchronizationGraph {
             warn!("db error when flushing block data");
             insert_success = false;
         }
+
+        debug!(
+            "new block inserted into graph: block_header={:?}, tx_count={}, block_size={}",
+            block.block_header,
+            block.transactions.len(),
+            block.size(),
+        );
 
         (insert_success, need_to_relay)
     }
@@ -1169,6 +1178,8 @@ impl SynchronizationGraph {
         }
     }
 
+    pub fn log_statistics(&self) { self.statistics.log_statistics(); }
+
     pub fn block_cache_gc(&self) {
         let current_size = self.cache_size().total();
         let mut consensus_inner = self.consensus.inner.write();
@@ -1191,11 +1202,6 @@ impl SynchronizationGraph {
             consensus_inner.transaction_addresses.len(),
             transaction_pubkey_cache.len(),
             unexecuted_transaction_addresses.len()
-        );
-
-        info!(
-            "Synchronization graph- inserted block count: {}",
-            self.stat_get_inserted_count()
         );
 
         cache_man.collect_garbage(current_size, |ids| {
@@ -1243,11 +1249,7 @@ impl SynchronizationGraph {
     // Manage statistics
 
     pub fn stat_inc_inserted_count(&self) {
-        let mut stat = self.statistics.write();
-        stat.inserted_block_count += 1;
-    }
-
-    pub fn stat_get_inserted_count(&self) -> usize {
-        self.statistics.read().inserted_block_count
+        let mut inner = self.statistics.inner.write();
+        inner.sync_graph.inserted_block_count += 1;
     }
 }

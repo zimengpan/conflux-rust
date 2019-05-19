@@ -32,10 +32,11 @@ use cfxcore::{
 use crate::rpc::{
     impls::cfx::RpcImpl, setup_debug_rpc_apis, setup_public_rpc_apis, RpcBlock,
 };
-use cfx_types::Address;
+use cfx_types::{Address, U256};
 use ctrlc::CtrlC;
 use db::SystemDB;
-use monitor::Monitor;
+use keylib::public_to_address;
+use network::NetworkService;
 use parking_lot::{Condvar, Mutex};
 use primitives::Block;
 use secret_store::SecretStore;
@@ -50,12 +51,15 @@ use std::{
     time::{Duration, Instant},
 };
 use threadpool::ThreadPool;
-use txgen::TransactionGenerator;
+use txgen::{
+    propagate::DataPropagation, SpecialTransactionGenerator,
+    TransactionGenerator,
+};
 
 /// Used in Genesis author to indicate testnet version
 /// Increase by one for every test net reset
 const TESTNET_VERSION: &'static str =
-    "0000000000000000000000000000000000000002";
+    "0000000000000000000000000000000000000003";
 
 pub struct ClientHandle {
     pub debug_rpc_http_server: Option<HttpServer>,
@@ -191,20 +195,26 @@ impl Client {
             pow_config.clone(),
         ));
 
-        let sync_config = cfxcore::SynchronizationConfiguration {
-            network: network_config,
-            consensus: consensus.clone(),
-        };
         let verification_config = conf.verification_config();
         let protocol_config = conf.protocol_config();
         let mut sync = cfxcore::SynchronizationService::new(
-            sync_config,
+            NetworkService::new(network_config),
+            consensus.clone(),
             protocol_config,
             verification_config,
             pow_config.clone(),
             conf.fast_recover(),
         );
         sync.start().unwrap();
+
+        if conf.raw_conf.test_mode && conf.raw_conf.data_propagate_enabled {
+            DataPropagation::register(
+                conf.raw_conf.data_propagate_interval_ms,
+                conf.raw_conf.data_propagate_size,
+                sync.get_network_service(),
+            )?;
+        }
+
         let sync = Arc::new(sync);
         let sync_graph = sync.get_synchronization_graph();
 
@@ -215,6 +225,14 @@ impl Client {
             secret_store.clone(),
             sync.net_key_pair().ok(),
         ));
+
+        let special_txgen =
+            Arc::new(Mutex::new(SpecialTransactionGenerator::new(
+                sync.net_key_pair().unwrap(),
+                &public_to_address(secret_store.get_keypair(0).public()),
+                U256::from_dec_str("10000000000000000").unwrap(),
+                U256::from_dec_str("10000000000000000").unwrap(),
+            )));
 
         let blockgen_config = conf.blockgen_config();
         if let Some(chain_path) = blockgen_config.test_chain_path {
@@ -246,6 +264,7 @@ impl Client {
             txpool.clone(),
             sync.clone(),
             txgen.clone(),
+            special_txgen.clone(),
             pow_config.clone(),
             maybe_author.clone().unwrap_or_default(),
         ));
@@ -324,15 +343,6 @@ impl Client {
             },
         )?;
 
-        // initialize Monitor
-        Monitor::init(
-            conf.raw_conf.monitor_host,
-            conf.raw_conf.monitor_db,
-            conf.raw_conf.monitor_username,
-            conf.raw_conf.monitor_password,
-            conf.raw_conf.monitor_node,
-        );
-
         Ok(ClientHandle {
             ledger_db: Arc::downgrade(&ledger_db),
             debug_rpc_http_server,
@@ -373,9 +383,6 @@ impl Client {
         BlockGenerator::stop(&blockgen);
         drop(blockgen);
         drop(to_drop);
-
-        // Stop Monitor
-        Monitor::stop();
 
         // Make sure ledger_db is properly dropped, so rocksdb can be closed
         // cleanly

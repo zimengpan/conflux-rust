@@ -19,6 +19,7 @@ pub struct StateManager {
     delta_trie: MultiVersionMerklePatriciaTrie,
     pub db: Arc<SystemDB>,
     commit_lock: Mutex<AtomicCommit>,
+    pub number_commited_nodes: AtomicUsize,
 }
 
 impl StateManager {
@@ -113,6 +114,7 @@ impl StateManager {
             commit_lock: Mutex::new(AtomicCommit {
                 row_number: RowNumber { value: row_number },
             }),
+            number_commited_nodes: Default::default(),
         }
     }
 
@@ -137,20 +139,26 @@ impl StateManager {
         }
 
         let root = state.compute_state_root().unwrap();
-        let genesis = Block {
-            block_header: BlockHeaderBuilder::new()
+        let genesis = Block::new(
+            BlockHeaderBuilder::new()
                 .with_deferred_state_root(root)
                 .with_gas_limit(genesis_gas_limit)
                 .with_author(test_net_version)
                 .build(),
-            transactions: Vec::new(),
-        };
+            Vec::new(),
+        );
         debug!("Genesis Block:{:?} hash={:?}", genesis, genesis.hash());
         state.commit(genesis.block_header.hash()).unwrap();
         genesis
     }
 
-    pub fn log_usage(&self) { self.delta_trie.log_usage(); }
+    pub fn log_usage(&self) {
+        self.delta_trie.log_usage();
+        info!(
+            "number of nodes committed to db {}",
+            self.number_commited_nodes.load(Ordering::Relaxed),
+        );
+    }
 
     pub fn state_exists(&self, epoch_id: EpochId) -> bool {
         if let Ok(state) = self.get_state_at(epoch_id) {
@@ -168,6 +176,7 @@ impl StateManagerTrait for StateManager {
     fn make_snapshot(&self, epoch_id: EpochId) -> Snapshot { unimplemented!() }
 
     fn get_state_at(&self, epoch_id: EpochId) -> Result<State> {
+        // FIXME: only allow existing epoch id and H256::Default().
         Ok(State::new(self, self.get_state_root_node_ref(epoch_id)?))
     }
 
@@ -194,5 +203,8 @@ use primitives::{Account, Block, BlockHeaderBuilder, EpochId};
 use rlp::encode;
 use std::{
     io, str,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
 };

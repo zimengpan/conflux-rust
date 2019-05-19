@@ -14,19 +14,17 @@ use cfx_types::H256;
 use io::TimerToken;
 use message::{
     GetBlockHeaders, GetBlockHeadersResponse, GetBlockTxn, GetBlockTxnResponse,
-    GetBlocks, GetBlocksResponse, GetCompactBlocks, GetCompactBlocksResponse,
-    GetTerminalBlockHashes, GetTerminalBlockHashesResponse, Message, MsgId,
-    NewBlock, NewBlockHashes, Status, Transactions,
+    GetBlocks, GetBlocksResponse, GetBlocksWithPublicResponse,
+    GetCompactBlocks, GetCompactBlocksResponse, GetTerminalBlockHashes,
+    GetTerminalBlockHashesResponse, Message, MsgId, NewBlock, NewBlockHashes,
+    Status, TransactionPropagationControl, Transactions,
 };
 use network::{
     throttling::THROTTLING_SERVICE, Error as NetworkError, HandlerWorkType,
     NetworkContext, NetworkProtocolHandler, PeerId,
 };
 use parking_lot::{Mutex, RwLock};
-use primitives::{
-    block::{MAX_BLOCK_SIZE_IN_BYTES, MAX_TRANSACTION_COUNT_PER_BLOCK},
-    Block, SignedTransaction,
-};
+use primitives::{Block, SignedTransaction};
 use rand::{Rng, RngCore};
 use rlp::Rlp;
 //use slab::Slab;
@@ -52,16 +50,17 @@ use std::{
 };
 use threadpool::ThreadPool;
 
-const CATCH_UP_EPOCH_LAG_THRESHOLD: u64 = 2;
+const CATCH_UP_EPOCH_LAG_THRESHOLD: u64 = 3;
 
 pub const SYNCHRONIZATION_PROTOCOL_VERSION: u8 = 0x01;
 
 pub const MAX_HEADERS_TO_SEND: u64 = 512;
 pub const MAX_BLOCKS_TO_SEND: u64 = 256;
+const MAX_PACKET_SIZE: usize = 15 * 1024 * 1024 + 512 * 1024; // 15.5 MB
 const MIN_PEERS_PROPAGATION: usize = 4;
 const MAX_PEERS_PROPAGATION: usize = 128;
 const DEFAULT_GET_HEADERS_NUM: u64 = 1;
-const DEFAULT_GET_PARENT_HEADERS_NUM: u64 = 100;
+const DEFAULT_GET_PARENT_HEADERS_NUM: u64 = 30;
 const REQUEST_START_WAITING_TIME_SECONDS: u64 = 1;
 //const REQUEST_WAITING_TIME_BACKOFF: u32 = 2;
 
@@ -70,6 +69,8 @@ const CHECK_REQUEST_TIMER: TimerToken = 1;
 const BLOCK_CACHE_GC_TIMER: TimerToken = 2;
 const CHECK_CATCH_UP_MODE_TIMER: TimerToken = 3;
 const LOG_STATISTIC_TIMER: TimerToken = 4;
+
+const MAX_TXS_BYTES_TO_PROPOGATE: usize = 10_000_000;
 
 #[derive(Eq, PartialEq, PartialOrd, Ord)]
 enum WaitingRequest {
@@ -112,6 +113,9 @@ pub struct ProtocolConfiguration {
     pub headers_request_timeout: Duration,
     pub blocks_request_timeout: Duration,
     pub max_inflight_request_count: u64,
+    pub start_as_catch_up_mode: bool,
+    pub request_block_with_public: bool,
+    pub max_trans_count_received_in_catch_up: u64,
 }
 
 #[derive(Debug)]
@@ -175,6 +179,7 @@ impl SynchronizationProtocolHandler {
         fast_recover: bool,
     ) -> Self
     {
+        let start_as_catch_up_mode = protocol_config.start_as_catch_up_mode;
         SynchronizationProtocolHandler {
             protocol_config,
             graph: Arc::new(SynchronizationGraph::new(
@@ -183,7 +188,7 @@ impl SynchronizationProtocolHandler {
                 pow_config,
                 fast_recover,
             )),
-            syn: RwLock::new(SynchronizationState::new()),
+            syn: RwLock::new(SynchronizationState::new(start_as_catch_up_mode)),
             headers_in_flight: Default::default(),
             header_request_waittime: Default::default(),
             blocks_in_flight: Default::default(),
@@ -229,7 +234,12 @@ impl SynchronizationProtocolHandler {
         raw.extend(msg.rlp_bytes().iter());
         if let Err(e) = io.send(peer, raw, priority) {
             debug!("Error sending message: {:?}", e);
-            io.disconnect_peer(peer);
+            match e.kind() {
+                network::ErrorKind::OversizedPacket => {}
+                _ => {
+                    io.disconnect_peer(peer);
+                }
+            }
             return Err(e);
         };
         debug!(
@@ -257,6 +267,9 @@ impl SynchronizationProtocolHandler {
             MsgId::GET_BLOCKS_RESPONSE => {
                 self.on_blocks_response(io, peer, &rlp)
             }
+            MsgId::GET_BLOCKS_WITH_PUBLIC_RESPONSE => {
+                self.on_blocks_with_public_response(io, peer, &rlp)
+            }
             MsgId::GET_BLOCKS => self.on_get_blocks(io, peer, &rlp),
             MsgId::GET_TERMINAL_BLOCK_HASHES_RESPONSE => {
                 self.on_terminal_block_hashes_response(io, peer, &rlp)
@@ -264,7 +277,7 @@ impl SynchronizationProtocolHandler {
             MsgId::GET_TERMINAL_BLOCK_HASHES => {
                 self.on_get_terminal_block_hashes(io, peer, &rlp)
             }
-            MsgId::TRANSACTIONS => self.on_transactions(peer, &rlp),
+            MsgId::TRANSACTIONS => self.on_transactions(io, peer, &rlp),
             MsgId::GET_CMPCT_BLOCKS => {
                 self.on_get_compact_blocks(io, peer, &rlp)
             }
@@ -274,6 +287,9 @@ impl SynchronizationProtocolHandler {
             MsgId::GET_BLOCK_TXN => self.on_get_blocktxn(io, peer, &rlp),
             MsgId::GET_BLOCK_TXN_RESPONSE => {
                 self.on_get_blocktxn_response(io, peer, &rlp)
+            }
+            MsgId::TRANSACTION_PROPAGATION_CONTROL => {
+                self.on_trans_prop_ctrl(peer, &rlp)
             }
             _ => {
                 warn!("Unknown message: peer={:?} msgid={:?}", peer, msg_id);
@@ -388,10 +404,7 @@ impl SynchronizationProtocolHandler {
                                 .collect();
                             self.blocks_in_flight.lock().remove(&hash);
                             let (success, to_relay) = self.graph.insert_block(
-                                Block {
-                                    block_header: header,
-                                    transactions: trans,
-                                },
+                                Block::new(header, trans),
                                 true,  // need_to_verify
                                 true,  // persistent
                                 false, // sync_graph_only
@@ -547,10 +560,7 @@ impl SynchronizationProtocolHandler {
                             // FIXME Should check if hash matches
 
                             let (success, to_relay) = self.graph.insert_block(
-                                Block {
-                                    block_header: header,
-                                    transactions: trans,
-                                },
+                                Block::new(header, trans),
                                 true,
                                 true,
                                 false,
@@ -605,7 +615,9 @@ impl SynchronizationProtocolHandler {
         Ok(())
     }
 
-    fn on_transactions(&self, peer: PeerId, rlp: &Rlp) -> Result<(), Error> {
+    fn on_transactions(
+        &self, io: &NetworkContext, peer: PeerId, rlp: &Rlp,
+    ) -> Result<(), Error> {
         if !self.syn.read().peers.contains_key(&peer) {
             warn!("Unexpected message from unrecognized peer: peer={:?} msg=TRANSACTIONS", peer);
             return Ok(());
@@ -619,13 +631,28 @@ impl SynchronizationProtocolHandler {
             peer
         );
 
-        self.syn
-            .write()
-            .peers
-            .get_mut(&peer)
-            .ok_or(ErrorKind::UnknownPeer)?
-            .last_sent_transactions
-            .extend(transactions.iter().map(|tx| tx.hash()));
+        {
+            let mut syn = self.syn.write();
+
+            let peer_info =
+                syn.peers.get_mut(&peer).ok_or(ErrorKind::UnknownPeer)?;
+            if peer_info.notified_mode.is_some()
+                && (peer_info.notified_mode.unwrap() == true)
+            {
+                peer_info.received_transaction_count += transactions.len();
+                if peer_info.received_transaction_count
+                    > self.protocol_config.max_trans_count_received_in_catch_up
+                        as usize
+                {
+                    io.disconnect_peer(peer);
+                    return Err(ErrorKind::TooManyTrans.into());
+                }
+            }
+
+            peer_info
+                .last_sent_transactions
+                .extend(transactions.iter().map(|tx| tx.hash()));
+        }
 
         self.get_transaction_pool().insert_new_transactions(
             self.graph.consensus.best_state_block_hash(),
@@ -674,6 +701,26 @@ impl SynchronizationProtocolHandler {
         Ok(())
     }
 
+    fn on_trans_prop_ctrl(&self, peer: PeerId, rlp: &Rlp) -> Result<(), Error> {
+        if !self.syn.read().peers.contains_key(&peer) {
+            warn!("Unexpected message from unrecognized peer: peer={:?} msg=TRANSACTION_PROPAGATION_CONTROL", peer);
+            return Ok(());
+        }
+
+        let trans_prop_ctrl = rlp.as_val::<TransactionPropagationControl>()?;
+        debug!(
+            "on_trans_prop_ctrl, peer {}, msg=:{:?}",
+            peer, trans_prop_ctrl
+        );
+
+        let mut syn = self.syn.write();
+        if let Some(peer_info) = syn.peers.get_mut(&peer) {
+            peer_info.need_prop_trans = !trans_prop_ctrl.catch_up_mode;
+        }
+
+        Ok(())
+    }
+
     fn on_get_blocks(
         &self, io: &NetworkContext, peer: PeerId, rlp: &Rlp,
     ) -> Result<(), Error> {
@@ -686,22 +733,101 @@ impl SynchronizationProtocolHandler {
         debug!("on_get_blocks, msg=:{:?}", req);
         if req.hashes.is_empty() {
             debug!("Received empty getblocks message: peer={:?}", peer);
-        } else {
-            let msg: Box<dyn Message> = Box::new(GetBlocksResponse {
+        } else if req.with_public {
+            let mut blocks = Vec::new();
+            let mut packet_size_left = MAX_PACKET_SIZE;
+            for hash in req.hashes.iter() {
+                if let Some(block) = self.graph.block_by_hash(hash) {
+                    if packet_size_left
+                        >= block.approximated_rlp_size_with_public()
+                    {
+                        packet_size_left -=
+                            block.approximated_rlp_size_with_public();
+                        let block = block.as_ref().clone();
+                        blocks.push(block);
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            let mut msg = Box::new(GetBlocksWithPublicResponse {
                 request_id: req.request_id().into(),
-                blocks: req
-                    .hashes
-                    .iter()
-                    .take(MAX_BLOCKS_TO_SEND as usize)
-                    .filter_map(|hash| {
-                        self.graph
-                            .block_by_hash(hash)
-                            .map(|b| b.as_ref().clone())
-                    })
-                    .collect(),
+                blocks,
             });
-            self.send_message(io, peer, msg.as_ref(), SendQueuePriority::High)?;
+
+            loop {
+                if msg.blocks.is_empty() {
+                    info!("No block is sent for GetBlocks request!");
+                    break;
+                }
+
+                if let Err(e) = self.send_message(
+                    io,
+                    peer,
+                    msg.as_ref(),
+                    SendQueuePriority::High,
+                ) {
+                    match e.kind() {
+                        network::ErrorKind::OversizedPacket => {
+                            let block_count = msg.blocks.len() / 2;
+                            msg.blocks.truncate(block_count);
+                        }
+                        _ => {
+                            return Err(e.into());
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+        } else {
+            let mut blocks = Vec::new();
+            let mut packet_size_left = MAX_PACKET_SIZE;
+            for hash in req.hashes.iter() {
+                if let Some(block) = self.graph.block_by_hash(hash) {
+                    if packet_size_left >= block.approximated_rlp_size() {
+                        packet_size_left -= block.approximated_rlp_size();
+                        let block = block.as_ref().clone();
+                        blocks.push(block);
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            let mut msg = Box::new(GetBlocksResponse {
+                request_id: req.request_id().into(),
+                blocks,
+            });
+
+            loop {
+                if msg.blocks.is_empty() {
+                    info!("No block is sent for GetBlocks request!");
+                    break;
+                }
+
+                if let Err(e) = self.send_message(
+                    io,
+                    peer,
+                    msg.as_ref(),
+                    SendQueuePriority::High,
+                ) {
+                    match e.kind() {
+                        network::ErrorKind::OversizedPacket => {
+                            let block_count = msg.blocks.len() / 2;
+                            msg.blocks.truncate(block_count);
+                        }
+                        _ => {
+                            return Err(e.into());
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
         }
+
         Ok(())
     }
 
@@ -715,9 +841,10 @@ impl SynchronizationProtocolHandler {
 
         let req = rlp.as_val::<GetTerminalBlockHashes>()?;
         debug!("on_get_terminal_block_hashes, msg=:{:?}", req);
+        let (_guard, best_info) = self.graph.get_best_info().into();
         let msg: Box<dyn Message> = Box::new(GetTerminalBlockHashesResponse {
             request_id: req.request_id().into(),
-            hashes: self.graph.get_best_info().terminal_block_hashes,
+            hashes: best_info.terminal_block_hashes,
         });
         self.send_message(io, peer, msg.as_ref(), SendQueuePriority::High)?;
         Ok(())
@@ -796,6 +923,9 @@ impl SynchronizationProtocolHandler {
                 .max_inflight_request_count,
             pending_requests: VecDeque::new(),
             last_sent_transactions: HashSet::new(),
+            received_transaction_count: 0,
+            need_prop_trans: true,
+            notified_mode: None,
         };
 
         debug!(
@@ -948,13 +1078,20 @@ impl SynchronizationProtocolHandler {
                 self.request_block_headers(io, Some(peer), past_hash, num);
             }
         }
+
+        let catch_up_mode = self.syn.read().catch_up_mode;
+
         if !hashes.is_empty() {
-            // TODO configure which path to use
-            self.request_compact_block(io, Some(peer), hashes);
-            // self.request_blocks(io, Some(peer), hashes);
+            // FIXME: This is a naive strategy. Need to
+            // make it more sophisticated.
+            if catch_up_mode {
+                self.request_blocks(io, Some(peer), hashes);
+            } else {
+                self.request_compact_block(io, Some(peer), hashes);
+            }
         }
 
-        if !need_to_relay.is_empty() && !self.syn.read().catch_up_mode {
+        if !need_to_relay.is_empty() && !catch_up_mode {
             let new_block_hash_msg: Box<dyn Message> =
                 Box::new(NewBlockHashes {
                     block_hashes: need_to_relay,
@@ -1009,9 +1146,49 @@ impl SynchronizationProtocolHandler {
         Ok(())
     }
 
-    fn on_blocks_inner(&self, io: &NetworkContext) -> Result<(), Error> {
-        let mut task = self.recover_public_queue.lock().pop_front().unwrap();
+    fn on_blocks_with_public_response(
+        &self, io: &NetworkContext, peer: PeerId, rlp: &Rlp,
+    ) -> Result<(), Error> {
+        if !self.syn.read().peers.contains_key(&peer) {
+            warn!("Unexpected message from unrecognized peer: peer={:?} msg=GET_BLOCKS_WITH_PUBLIC_RESPONSE", peer);
+            return Ok(());
+        }
 
+        let blocks = rlp.as_val::<GetBlocksWithPublicResponse>()?;
+        debug!(
+            "on_blocks_with_public_response, get block hashes {:?}",
+            blocks
+                .blocks
+                .iter()
+                .map(|b| b.block_header.hash())
+                .collect::<Vec<H256>>()
+        );
+        let req = self.match_request(io, peer, blocks.request_id())?;
+        let req_hashes_vec = match req {
+            RequestMessage::Blocks(request) => request.hashes,
+            RequestMessage::Compact(request) => request.hashes,
+            _ => {
+                warn!("Get response not matching the request! req={:?}, resp={:?}", req, blocks);
+                return Err(ErrorKind::UnexpectedResponse.into());
+            }
+        };
+        let requested_blocks: HashSet<H256> =
+            req_hashes_vec.into_iter().collect();
+
+        self.dispatch_recover_public_task(
+            io,
+            blocks.blocks,
+            requested_blocks,
+            peer,
+            false,
+        );
+
+        Ok(())
+    }
+
+    fn on_blocks_inner(
+        &self, io: &NetworkContext, mut task: RecoverPublicTask,
+    ) -> Result<(), Error> {
         let mut need_to_relay = Vec::new();
         for mut block in task.blocks {
             let hash = block.hash();
@@ -1022,6 +1199,7 @@ impl SynchronizationProtocolHandler {
 
             if Self::recover_public(
                 &mut block,
+                self.get_transaction_pool(),
                 &mut *self
                     .get_transaction_pool()
                     .transaction_pubkey_cache
@@ -1111,6 +1289,11 @@ impl SynchronizationProtocolHandler {
         Ok(())
     }
 
+    fn on_blocks_inner_task(&self, io: &NetworkContext) -> Result<(), Error> {
+        let task = self.recover_public_queue.lock().pop_front().unwrap();
+        self.on_blocks_inner(io, task)
+    }
+
     pub fn on_mined_block(&self, mut block: Block) -> Vec<H256> {
         let hash = block.block_header.hash();
         info!("Mined block {:?} header={:?}", hash, block.block_header);
@@ -1170,6 +1353,7 @@ impl SynchronizationProtocolHandler {
         let mut block = new_block.block;
         Self::recover_public(
             &mut block,
+            self.get_transaction_pool(),
             &mut *self.get_transaction_pool().transaction_pubkey_cache.write(),
             &mut *self.graph.cache_man.lock(),
             &*self.get_transaction_pool().worker_pool.lock(),
@@ -1285,15 +1469,14 @@ impl SynchronizationProtocolHandler {
     ) -> Result<(), NetworkError> {
         debug!("Sending status message to {:?}", peer);
 
+        let (_guard, best_info) = self.graph.get_best_info().into();
+
         let msg: Box<dyn Message> = Box::new(Status {
             protocol_version: SYNCHRONIZATION_PROTOCOL_VERSION,
             network_id: 0x0,
             genesis_hash: *self.graph.genesis_hash(),
-            best_epoch: self.graph.best_epoch_number(),
-            terminal_block_hashes: self
-                .graph
-                .get_best_info()
-                .terminal_block_hashes,
+            best_epoch: best_info.best_epoch_number as u64,
+            terminal_block_hashes: best_info.terminal_block_hashes,
         });
         self.send_message(io, peer, msg.as_ref(), SendQueuePriority::High)
     }
@@ -1431,7 +1614,7 @@ impl SynchronizationProtocolHandler {
                    );
                     self.requests_queue.lock().push(timed_req);
                 } else {
-                    warn!("Header request is added in pending queue. peer {}, hash {:?}", peer_id, *hash);
+                    debug!("Header request is added in pending queue. peer {}, hash {:?}", peer_id, *hash);
                 }
                 Ok(())
             }
@@ -1474,7 +1657,13 @@ impl SynchronizationProtocolHandler {
             return;
         }
         if self
-            .request_blocks_unchecked(io, peer_id, &hashes, syn)
+            .request_blocks_unchecked(
+                io,
+                peer_id,
+                &hashes,
+                self.request_block_need_public(syn.catch_up_mode),
+                syn,
+            )
             .is_err()
         {
             let mut block_request_waittime = self.block_request_waittime.lock();
@@ -1492,7 +1681,7 @@ impl SynchronizationProtocolHandler {
 
     fn request_blocks_unchecked(
         &self, io: &NetworkContext, peer_id: PeerId, hashes: &Vec<H256>,
-        syn: &mut SynchronizationState,
+        with_public: bool, syn: &mut SynchronizationState,
     ) -> Result<(), Error>
     {
         match self.send_request(
@@ -1500,6 +1689,7 @@ impl SynchronizationProtocolHandler {
             peer_id,
             Box::new(RequestMessage::Blocks(GetBlocks {
                 request_id: 0.into(),
+                with_public,
                 hashes: hashes.clone(),
             })),
             syn,
@@ -1513,7 +1703,7 @@ impl SynchronizationProtocolHandler {
                     );
                     self.requests_queue.lock().push(timed_req);
                 } else {
-                    warn!("Blocks request is added in pending queue. peer {}, hashes {:?}", peer_id, hashes);
+                    debug!("Blocks request is added in pending queue. peer {}, hashes {:?}", peer_id, hashes);
                 }
                 Ok(())
             }
@@ -1595,7 +1785,7 @@ impl SynchronizationProtocolHandler {
                     );
                     self.requests_queue.lock().push(timed_req);
                 } else {
-                    warn!("Compact block request is added in pending queue. peer {}, hashes {:?}", peer_id, hashes);
+                    debug!("Compact block request is added in pending queue. peer {}, hashes {:?}", peer_id, hashes);
                 }
                 Ok(())
             }
@@ -1628,7 +1818,7 @@ impl SynchronizationProtocolHandler {
                     );
                     self.requests_queue.lock().push(timed_req);
                 } else {
-                    warn!("request_blocktxn is added in pending queue. peer {}, hash {:?}", peer_id, block_hash);
+                    debug!("request_blocktxn is added in pending queue. peer {}, hash {:?}", peer_id, block_hash);
                 }
                 Ok(())
             }
@@ -1809,44 +1999,50 @@ impl SynchronizationProtocolHandler {
                 .filter_map(|peer_id| {
                     let peer_info = syn.peers.get_mut(&peer_id)
                         .expect("peer_id is from peers; peers is result of select_peers_for_transactions; select_peers_for_transactions selects peers from syn.peers; qed");
-
-                    // filter out transactions that already sent to remote peer.
-                    let mut txs: Vec<Arc<SignedTransaction>> = transactions
-                        .iter()
-                        .filter(|tx| !peer_info.last_sent_transactions.contains(&tx.hash()))
-                        .map(|tx| tx.clone())
-                        .collect();
-
-                    if txs.is_empty() {
+                    if !peer_info.need_prop_trans {
                         return None;
                     }
 
-                    if txs.len() > MAX_TRANSACTION_COUNT_PER_BLOCK {
-                        debug!("cannot propagate all txs from pool due to max txs limitation, num_txs = {}, limitation = {}", txs.len(), MAX_TRANSACTION_COUNT_PER_BLOCK);
-                        txs.truncate(MAX_TRANSACTION_COUNT_PER_BLOCK);
-                    }
+                    // Send all transactions
+                    if peer_info.last_sent_transactions.is_empty() {
+                        let mut tx_msg = Box::new(Transactions { transactions: Vec::new() });
+                        let mut total_tx_bytes = 0;
+                        for tx in &transactions {
+                            total_tx_bytes += tx.rlp_size();
+                            if total_tx_bytes >= MAX_TXS_BYTES_TO_PROPOGATE {
+                                break
+                            }
 
-                    // limits the size of propagated txs.
-                    let mut sum_size = 0;
-                    for i in 0..txs.len() {
-                        let size = txs[i].rlp_size();
-                        if sum_size + size > MAX_BLOCK_SIZE_IN_BYTES {
-                            debug!("cannot propagate all txs from pool due to block size limitation, cur_size = {}, tx_size = {}, max_block_size = {}", sum_size, size, MAX_BLOCK_SIZE_IN_BYTES);
-                            txs.truncate(i);
-                            break;
+                            tx_msg.transactions.push(tx.transaction.clone());
+                            peer_info.last_sent_transactions.insert(tx.hash());
                         }
-
-                        sum_size += size;
+                        return Some((peer_id, transactions.len(), tx_msg));
                     }
 
+                    // Get hashes of all transactions to send to this peer
+                    let to_send = all_transactions_hashes.difference(&peer_info.last_sent_transactions)
+                        .cloned()
+                        .collect::<HashSet<_>>();
+                    if to_send.is_empty() {
+                        return None;
+                    }
+
+                    peer_info.last_sent_transactions = all_transactions_hashes
+                        .intersection(&peer_info.last_sent_transactions).cloned().collect();
                     let mut tx_msg = Box::new(Transactions { transactions: Vec::new() });
-                    for tx in &txs {
-                        tx_msg.transactions.push(tx.transaction.clone());
+                    let mut total_tx_bytes = 0;
+                    for tx in &transactions {
+                        if to_send.contains(&tx.hash()) {
+                            total_tx_bytes += tx.rlp_size();
+                            if total_tx_bytes >= MAX_TXS_BYTES_TO_PROPOGATE {
+                                break
+                            }
+
+                            tx_msg.transactions.push(tx.transaction.clone());
+                            peer_info.last_sent_transactions.insert(tx.hash());
+                        }
                     }
-
-                    peer_info.last_sent_transactions = all_transactions_hashes.clone();
-
-                    Some((peer_id, txs.len(), tx_msg))
+                    Some((peer_id, tx_msg.transactions.len(), tx_msg))
                 })
                 .collect::<Vec<_>>()
         };
@@ -1991,6 +2187,9 @@ impl SynchronizationProtocolHandler {
                                 io,
                                 chosen_peer,
                                 &blocks,
+                                self.request_block_need_public(
+                                    syn.catch_up_mode,
+                                ),
                                 syn,
                             )
                             .is_err()
@@ -2095,37 +2294,60 @@ impl SynchronizationProtocolHandler {
     }
 
     pub fn recover_public(
-        block: &mut Block,
+        block: &mut Block, tx_pool: SharedTransactionPool,
         tx_cache: &mut HashMap<H256, Arc<SignedTransaction>>,
         cache_man: &mut CacheManager<CacheId>, worker_pool: &ThreadPool,
     ) -> Result<(), DecoderError>
     {
+        debug!("recover public for block started.");
         let mut recovered_transactions =
             Vec::with_capacity(block.transactions.len());
         let mut uncached_trans = Vec::with_capacity(block.transactions.len());
         for (idx, transaction) in block.transactions.iter().enumerate() {
             match tx_cache.get(&transaction.hash()) {
                 Some(tx) => recovered_transactions.push(tx.clone()),
-                None => {
-                    uncached_trans.push((idx, transaction.clone()));
-                    recovered_transactions.push(transaction.clone());
-                }
+                None => match tx_pool.get_transaction(&transaction.hash()) {
+                    Some(tx) => recovered_transactions.push(tx.clone()),
+                    None => {
+                        uncached_trans.push((idx, transaction.clone()));
+                        recovered_transactions.push(transaction.clone());
+                    }
+                },
             }
         }
+
         if uncached_trans.len() < WORKER_COMPUTATION_PARALLELISM * 8 {
             for (idx, tx) in uncached_trans {
-                if let Ok(public) = tx.recover_public() {
-                    recovered_transactions[idx] = Arc::new(
-                        SignedTransaction::new(public, tx.transaction.clone()),
-                    );
+                if tx.public.is_none() {
+                    if let Ok(public) = tx.recover_public() {
+                        recovered_transactions[idx] =
+                            Arc::new(SignedTransaction::new(
+                                public,
+                                tx.transaction.clone(),
+                            ));
+                    } else {
+                        info!(
+                            "Unable to recover the public key of transaction {:?}",
+                            tx.hash()
+                        );
+                        return Err(DecoderError::Custom(
+                            "Cannot recover public key",
+                        ));
+                    }
                 } else {
-                    debug!(
-                        "Unable to recover the public key of transaction {:?}",
-                        tx.hash()
-                    );
-                    return Err(DecoderError::Custom(
-                        "Cannot recover public key",
-                    ));
+                    let res = tx.verify_public();
+                    if res.is_ok() && res.unwrap() {
+                        recovered_transactions[idx] =
+                            Arc::new(SignedTransaction::new(
+                                tx.public.unwrap(),
+                                tx.transaction.clone(),
+                            ));
+                    } else {
+                        info!("Failed to verify the public key of transaction {:?}", tx.hash());
+                        return Err(DecoderError::Custom(
+                            "Cannot recover public key",
+                        ));
+                    }
                 }
             }
         } else {
@@ -2161,13 +2383,24 @@ impl SynchronizationProtocolHandler {
                 worker_pool.execute(move || {
                     let mut signed_txes = Vec::new();
                     for (idx, tx) in unsigned_txes {
-                        if let Ok(public) = tx.recover_public() {
-                            signed_txes.push((idx, public));
+                        if tx.public.is_none() {
+                            if let Ok(public) = tx.recover_public() {
+                                signed_txes.push((idx, public));
+                            } else {
+                                info!(
+                                    "Unable to recover the public key of transaction {:?}",
+                                    tx.hash()
+                                );
+                                break;
+                            }
                         } else {
-                            debug!(
-                                "Unable to recover the public key of transaction {:?}",
-                                tx.hash()
-                            );
+                            let res = tx.verify_public();
+                            if res.is_ok() && res.unwrap() {
+                                signed_txes.push((idx, tx.public.clone().unwrap()));
+                            } else {
+                                info!("Failed to verify the public key of transaction {:?}", tx.hash());
+                                break;
+                            }
                         }
                     }
                     sender.send(signed_txes).unwrap();
@@ -2175,7 +2408,9 @@ impl SynchronizationProtocolHandler {
             }
             worker_pool.join();
 
+            let mut total_recovered_num = 0 as usize;
             for tx_publics in receiver.iter().take(n_thread) {
+                total_recovered_num += tx_publics.len();
                 for (idx, public) in tx_publics {
                     let tx = Arc::new(SignedTransaction::new(
                         public,
@@ -2186,9 +2421,18 @@ impl SynchronizationProtocolHandler {
                     recovered_transactions[idx] = tx;
                 }
             }
+
+            if total_recovered_num != tx_num {
+                info!(
+                    "Failed to recover public for block {:?}",
+                    block.block_header.hash()
+                );
+                return Err(DecoderError::Custom("Cannot recover public key"));
+            }
         }
 
         block.transactions = recovered_transactions;
+        debug!("recover public for block finished.");
         Ok(())
     }
 
@@ -2196,7 +2440,7 @@ impl SynchronizationProtocolHandler {
 
     fn log_statistics(&self) { self.graph.log_statistics(); }
 
-    fn update_catch_up_mode(&self) {
+    fn update_catch_up_mode(&self, io: &NetworkContext) {
         let mut peer_best_epoches = {
             let syn = self.syn.read();
             syn.peers
@@ -2212,16 +2456,53 @@ impl SynchronizationProtocolHandler {
         peer_best_epoches.sort();
         let middle_epoch = peer_best_epoches[peer_best_epoches.len() / 2];
 
-        if self.graph.best_epoch_number() + CATCH_UP_EPOCH_LAG_THRESHOLD
-            >= middle_epoch
-        {
+        let (need_notify, catch_up_mode) = {
             let mut syn = self.syn.write();
-            syn.catch_up_mode = false;
-        } else {
-            let mut syn = self.syn.write();
-            syn.catch_up_mode = true;
+            if self.graph.best_epoch_number() + CATCH_UP_EPOCH_LAG_THRESHOLD
+                >= middle_epoch
+            {
+                syn.catch_up_mode = false;
+            } else {
+                syn.catch_up_mode = true;
+            }
+
+            let catch_up_mode = syn.catch_up_mode;
+
+            let mut need_notify = Vec::new();
+            for (peer, state) in syn.peers.iter_mut() {
+                if state.notified_mode.is_none()
+                    || (state.notified_mode.unwrap() != catch_up_mode)
+                {
+                    state.received_transaction_count = 0;
+                    state.notified_mode = Some(catch_up_mode);
+                    need_notify.push(*peer);
+                }
+            }
+
+            (need_notify, catch_up_mode)
+        };
+
+        info!("Catch-up mode: {}", catch_up_mode);
+
+        let trans_prop_ctrl_msg: Box<dyn Message> =
+            Box::new(TransactionPropagationControl { catch_up_mode });
+
+        for peer in need_notify {
+            if self
+                .send_message(
+                    io,
+                    peer,
+                    trans_prop_ctrl_msg.as_ref(),
+                    SendQueuePriority::High,
+                )
+                .is_err()
+            {
+                info!(
+                    "Failed to send transaction control message to peer {}",
+                    peer
+                );
+            }
         }
-        info!("Catch-up mode: {}", self.syn.read().catch_up_mode);
     }
 
     fn dispatch_recover_public_task(
@@ -2239,6 +2520,10 @@ impl SynchronizationProtocolHandler {
             });
 
         io.dispatch_work(SyncHandlerWorkType::RecoverPublic as HandlerWorkType);
+    }
+
+    fn request_block_need_public(&self, catch_up_mode: bool) -> bool {
+        catch_up_mode && self.protocol_config.request_block_with_public
     }
 }
 
@@ -2276,7 +2561,7 @@ impl NetworkProtocolHandler for SynchronizationProtocolHandler {
         &self, io: &NetworkContext, work_type: HandlerWorkType,
     ) {
         if work_type == SyncHandlerWorkType::RecoverPublic as HandlerWorkType {
-            if let Err(e) = self.on_blocks_inner(io) {
+            if let Err(e) = self.on_blocks_inner_task(io) {
                 warn!("Error processing RecoverPublic task: {:?}", e);
             }
         } else {
@@ -2365,7 +2650,7 @@ impl NetworkProtocolHandler for SynchronizationProtocolHandler {
                 self.block_cache_gc();
             }
             CHECK_CATCH_UP_MODE_TIMER => {
-                self.update_catch_up_mode();
+                self.update_catch_up_mode(io);
             }
             LOG_STATISTIC_TIMER => {
                 self.log_statistics();

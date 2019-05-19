@@ -44,6 +44,9 @@ build_config! {
         (public_address, (Option<String>), None)
         (ledger_cache_size, (Option<usize>), Some(2048))
         (enable_discovery, (bool), true)
+        (discovery_fast_refresh_timeout_ms, (u64), 10000)
+        (discovery_round_timeout_ms, (u64), 500)
+        (discovery_housekeeping_timeout_ms, (u64), 1000)
         (node_table_timeout, (Option<u64>), Some(300))
         (node_table_promotion_timeout, (Option<u64>), Some(3 * 24 * 3600))
         (fast_recover, (bool), true)
@@ -65,6 +68,9 @@ build_config! {
         (headers_request_timeout_ms, (u64), 30_000)
         (blocks_request_timeout_ms, (u64), 120_000)
         (max_inflight_request_count, (u64), 32)
+        (start_as_catch_up_mode, (bool), false)
+        (max_trans_count_received_in_catch_up, (u64), 60_000)
+        (request_block_with_public, (bool), false)
         (load_test_chain, (Option<String>), None)
         (start_mining, (bool), false)
         (initial_difficulty, (Option<u64>), None)
@@ -74,11 +80,9 @@ build_config! {
         (egress_min_throttle, (usize), 10)
         (egress_max_throttle, (usize), 64)
         (p2p_nodes_per_ip, (usize), 1)
-        (monitor_host, (Option<String>), None)
-        (monitor_db, (Option<String>), None)
-        (monitor_username, (Option<String>), None)
-        (monitor_password, (Option<String>), None)
-        (monitor_node, (Option<String>), None)
+        (data_propagate_enabled, (bool), false)
+        (data_propagate_interval_ms, (u64), 1000)
+        (data_propagate_size, (usize), 1000)
     }
     {
         (
@@ -157,6 +161,14 @@ impl Configuration {
         }
         network_config.test_mode = self.raw_conf.test_mode;
         network_config.nodes_per_ip = self.raw_conf.p2p_nodes_per_ip;
+        network_config.fast_discovery_refresh_timeout = Duration::from_millis(
+            self.raw_conf.discovery_fast_refresh_timeout_ms,
+        );
+        network_config.discovery_round_timeout =
+            Duration::from_millis(self.raw_conf.discovery_round_timeout_ms);
+        network_config.housekeeping_timeout = Duration::from_millis(
+            self.raw_conf.discovery_housekeeping_timeout_ms,
+        );
         network_config
     }
 
@@ -244,6 +256,11 @@ impl Configuration {
             max_inflight_request_count: self
                 .raw_conf
                 .max_inflight_request_count,
+            request_block_with_public: self.raw_conf.request_block_with_public,
+            start_as_catch_up_mode: self.raw_conf.start_as_catch_up_mode,
+            max_trans_count_received_in_catch_up: self
+                .raw_conf
+                .max_trans_count_received_in_catch_up,
         }
     }
 

@@ -21,8 +21,9 @@ use jsonrpc_macros::Trailing;
 use network::node_table::{NodeEndpoint, NodeEntry, NodeId};
 use parking_lot::{Condvar, Mutex};
 use primitives::{
-    Action, EpochNumber as PrimitiveEpochNumber, SignedTransaction,
-    Transaction, TransactionWithSignature,
+    block::MAX_BLOCK_SIZE_IN_BYTES, Action,
+    EpochNumber as PrimitiveEpochNumber, SignedTransaction, Transaction,
+    TransactionWithSignature,
 };
 use rlp::Rlp;
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
@@ -99,7 +100,11 @@ impl RpcImpl {
             )
             .map_err(|err| RpcError::invalid_params(err))
             .and_then(|hash| {
-                let block = self.consensus.block_by_hash(&hash, false).unwrap();
+                let block = self
+                    .consensus
+                    .data_man
+                    .block_by_hash(&hash, false)
+                    .unwrap();
                 Ok(RpcBlock::new(&*block, inner, include_txs))
             })
     }
@@ -114,7 +119,8 @@ impl RpcImpl {
         );
         let inner = &mut *self.consensus.inner.write();
 
-        if let Some(block) = self.consensus.block_by_hash(&hash, false) {
+        if let Some(block) = self.consensus.data_man.block_by_hash(&hash, false)
+        {
             let result_block = Some(RpcBlock::new(&*block, inner, include_txs));
             Ok(result_block)
         } else {
@@ -140,7 +146,7 @@ impl RpcImpl {
             .map_err(|err| RpcError::invalid_params(err))
             .and_then(|_| {
                 if let Some(block) =
-                    self.consensus.block_by_hash(&block_hash, false)
+                    self.consensus.data_man.block_by_hash(&block_hash, false)
                 {
                     debug!("Build RpcBlock {}", block.hash());
                     let result_block = RpcBlock::new(&*block, inner, true);
@@ -162,6 +168,7 @@ impl RpcImpl {
             .map(|x| {
                 RpcBlock::new(
                     self.consensus
+                        .data_man
                         .block_by_hash(x, false)
                         .expect("Error to get block by hash")
                         .as_ref(),
@@ -198,6 +205,8 @@ impl RpcImpl {
         info!("RPC Request: cfx_getBlocks epoch_number={:?}", num);
 
         self.consensus
+            .inner
+            .read_recursive()
             .block_hashes_by_epoch(self.get_primitive_epoch_number(num))
             .map_err(|err| RpcError::invalid_params(err))
             .and_then(|vec| Ok(vec.into_iter().map(|x| x.into()).collect()))
@@ -342,8 +351,10 @@ impl RpcImpl {
         info!("RPC Request: generate({:?})", num_blocks);
         let mut hashes = Vec::new();
         for _i in 0..num_blocks {
-            hashes
-                .push(self.block_gen.generate_block_with_transactions(num_txs));
+            hashes.push(self.block_gen.generate_block_with_transactions(
+                num_txs,
+                MAX_BLOCK_SIZE_IN_BYTES,
+            ));
         }
         Ok(hashes)
     }
@@ -361,11 +372,37 @@ impl RpcImpl {
         Ok(hash)
     }
 
-    fn generate_one_block(&self, num_txs: usize) -> RpcResult<H256> {
+    fn generate_one_block(
+        &self, num_txs: usize, block_size_limit: usize,
+    ) -> RpcResult<H256> {
         info!("RPC Request: generate_one_block()");
-        // TODO Choose proper num_txs
-        let hash = self.block_gen.generate_block(num_txs);
+        let hash =
+            self.block_gen
+                .generate_block(num_txs, block_size_limit, vec![]);
         Ok(hash)
+    }
+
+    fn generate_one_block_special(
+        &self, num_txs: usize, mut block_size_limit: usize,
+        num_txs_simple: usize, num_txs_erc20: usize,
+    ) -> RpcResult<()>
+    {
+        info!("RPC Request: generate_one_block_special()");
+
+        let block_gen = &self.block_gen;
+        let special_transactions = block_gen.generate_special_transactions(
+            &mut block_size_limit,
+            num_txs_simple,
+            num_txs_erc20,
+        );
+
+        block_gen.generate_block(
+            num_txs,
+            block_size_limit,
+            special_transactions,
+        );
+
+        Ok(())
     }
 
     fn generate_custom_block(
@@ -421,7 +458,7 @@ impl RpcImpl {
     ) -> RpcResult<H256> {
         let transactions = self
             .decode_raw_txs(raw_txs_without_data, tx_data_len.unwrap_or(0))?;
-        Ok(self.block_gen.generate_custom_block(transactions, false))
+        Ok(self.block_gen.generate_custom_block(transactions))
     }
 
     fn get_peer_info(&self) -> RpcResult<Vec<PeerInfo>> {
@@ -751,8 +788,23 @@ impl TestRpc for TestRpcImpl {
             .generate_fixed_block(parent_hash, referee, num_txs)
     }
 
-    fn generate_one_block(&self, num_txs: usize) -> RpcResult<H256> {
-        self.rpc_impl.generate_one_block(num_txs)
+    fn generate_one_block(
+        &self, num_txs: usize, block_size_limit: usize,
+    ) -> RpcResult<H256> {
+        self.rpc_impl.generate_one_block(num_txs, block_size_limit)
+    }
+
+    fn generate_one_block_special(
+        &self, num_txs: usize, block_size_limit: usize, num_txs_simple: usize,
+        num_txs_erc20: usize,
+    ) -> RpcResult<()>
+    {
+        self.rpc_impl.generate_one_block_special(
+            num_txs,
+            block_size_limit,
+            num_txs_simple,
+            num_txs_erc20,
+        )
     }
 
     fn generate_custom_block(

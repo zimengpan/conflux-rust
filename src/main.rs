@@ -21,6 +21,30 @@ use parking_lot::{Condvar, Mutex};
 use std::{io as stdio, io::Write, process, str::FromStr, sync::Arc};
 
 fn main() {
+    #[cfg(feature = "deadlock_detection")]
+    {
+        // only for #[cfg]
+        use parking_lot::deadlock;
+        use std::{thread, time::Duration};
+
+        // Create a background thread which checks for deadlocks every 10s
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(10));
+            let deadlocks = deadlock::check_deadlock();
+            if deadlocks.is_empty() {
+                continue;
+            }
+
+            println!("{} deadlocks detected", deadlocks.len());
+            for (i, threads) in deadlocks.iter().enumerate() {
+                println!("Deadlock #{}", i);
+                for t in threads {
+                    println!("Thread Id {:#?}", t.thread_id());
+                    println!("{:#?}", t.backtrace());
+                }
+            }
+        });
+    } // only for #[cfg]
     let matches = App::new("conflux")
         .arg(
             Arg::with_name("port")
@@ -224,41 +248,6 @@ fn main() {
                 .help("Sets maximum number of P2P nodes for one IP address. Set 0 to allow unlimited nodes.")
                 .takes_value(true)
                 .validator(from_str_validator::<usize>),
-        )
-        .arg(
-            Arg::with_name("monitor-node")
-                .long("monitor-node")
-                .value_name("VALUE")
-                .help("Sets node's name in monitor.")
-                .takes_value(true)
-        )
-        .arg(
-            Arg::with_name("monitor-host")
-                .long("monitor-host")
-                .value_name("VALUE")
-                .help("Sets monitor's influxdb host.")
-                .takes_value(true)
-        )
-        .arg(
-            Arg::with_name("monitor-db")
-                .long("monitor-db")
-                .value_name("VALUE")
-                .help("Sets monitor's influxdb database.")
-                .takes_value(true)
-        )
-        .arg(
-            Arg::with_name("monitor-username")
-                .long("monitor-username")
-                .value_name("VALUE")
-                .help("Sets monitor's influxdb username.")
-                .takes_value(true)
-        )
-        .arg(
-            Arg::with_name("monitor-password")
-                .long("monitor-password")
-                .value_name("VALUE")
-                .help("Sets monitor's influxdb password.")
-                .takes_value(true)
         )
         .get_matches_from(std::env::args().collect::<Vec<_>>());
 

@@ -6,13 +6,16 @@ use crate::{
     cache_manager::{CacheId, CacheManager},
     db::{COL_BLOCKS, COL_BLOCK_RECEIPTS, COL_TX_ADDRESS},
     ext_db::SystemDB,
+    storage::StorageManager,
     verification::VerificationConfig,
+    SharedTransactionPool,
 };
 use cfx_types::{Bloom, H256};
 use heapsize::HeapSizeOf;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use primitives::{
-    receipt::Receipt, Block, BlockHeader, SignedTransaction, TransactionAddress,
+    receipt::{Receipt, TRANSACTION_OUTCOME_SUCCESS},
+    Block, BlockHeader, SignedTransaction, TransactionAddress,
 };
 use rlp::{Rlp, RlpStream};
 use std::{collections::HashMap, sync::Arc};
@@ -24,23 +27,51 @@ pub struct BlockDataManager {
     pub blocks: RwLock<HashMap<H256, Arc<Block>>>,
     pub block_receipts: RwLock<HashMap<H256, BlockReceiptsInfo>>,
     pub transaction_addresses: RwLock<HashMap<H256, TransactionAddress>>,
+    block_receipts_root: RwLock<HashMap<H256, H256>>,
+
+    pub record_tx_address: bool,
+
+    pub txpool: SharedTransactionPool,
+    pub genesis_block: Arc<Block>,
     pub db: Arc<SystemDB>,
+    pub storage_manager: Arc<StorageManager>,
     pub cache_man: Arc<Mutex<CacheManager<CacheId>>>,
 }
 
 impl BlockDataManager {
     pub fn new(
-        db: Arc<SystemDB>, cache_man: Arc<Mutex<CacheManager<CacheId>>>,
-    ) -> Self {
-        Self {
+        genesis_block: Arc<Block>, txpool: SharedTransactionPool,
+        db: Arc<SystemDB>, storage_manager: Arc<StorageManager>,
+        cache_man: Arc<Mutex<CacheManager<CacheId>>>, record_tx_address: bool,
+    ) -> Self
+    {
+        let data_man = Self {
             block_headers: RwLock::new(HashMap::new()),
             blocks: RwLock::new(HashMap::new()),
             block_receipts: Default::default(),
             transaction_addresses: Default::default(),
+            block_receipts_root: Default::default(),
+            txpool,
+            genesis_block,
             db,
+            storage_manager,
             cache_man,
-        }
+            record_tx_address,
+        };
+
+        data_man.insert_receipts_root(
+            data_man.genesis_block.hash(),
+            *data_man.genesis_block.block_header.deferred_receipts_root(),
+        );
+        data_man.insert_block_header(
+            data_man.genesis_block.hash(),
+            Arc::new(data_man.genesis_block.block_header.clone()),
+        );
+        data_man.insert_block_to_kv(data_man.genesis_block(), true);
+        data_man
     }
+
+    pub fn genesis_block(&self) -> Arc<Block> { self.genesis_block.clone() }
 
     pub fn transaction_by_hash(
         &self, hash: &H256,
@@ -91,6 +122,16 @@ impl BlockDataManager {
             self.cache_man.lock().note_used(CacheId::Block(*hash));
         }
         Some(block)
+    }
+
+    pub fn blocks_by_hash_list(
+        &self, hashes: &Vec<H256>, update_cache: bool,
+    ) -> Option<Vec<Arc<Block>>> {
+        let mut epoch_blocks = Vec::new();
+        for h in hashes {
+            epoch_blocks.push(self.block_by_hash(h, update_cache)?);
+        }
+        Some(epoch_blocks)
     }
 
     pub fn insert_block_to_kv(&self, block: Arc<Block>, persistent: bool) {
@@ -313,6 +354,18 @@ impl BlockDataManager {
     pub fn insert_transaction_address_to_kv(
         &self, hash: &H256, tx_address: &TransactionAddress,
     ) {
+        if !self.record_tx_address {
+            return;
+        }
+        self.transaction_addresses
+            .write()
+            .entry(*hash)
+            .and_modify(|v| {
+                *v = tx_address.clone();
+                self.cache_man
+                    .lock()
+                    .note_used(CacheId::TransactionAddress(*hash));
+            });
         let mut dbops = self.db.key_value().transaction();
         dbops.put(COL_TX_ADDRESS, hash, &rlp::encode(tx_address));
         self.db
@@ -332,6 +385,71 @@ impl BlockDataManager {
             }
             None => false,
         }
+    }
+
+    pub fn insert_receipts_root(
+        &self, block_hash: H256, receipts_root: H256,
+    ) -> Option<H256> {
+        self.block_receipts_root
+            .write()
+            .insert(block_hash, receipts_root)
+    }
+
+    pub fn get_receipts_root(&self, block_hash: &H256) -> Option<H256> {
+        self.block_receipts_root
+            .read()
+            .get(block_hash)
+            .map(Clone::clone)
+    }
+
+    /// Check if all executed results of an epoch exist
+    pub fn epoch_executed_and_recovered(
+        &self, epoch_hash: &H256, epoch_block_hashes: &Vec<H256>,
+        on_local_pivot: bool,
+    ) -> bool
+    {
+        // `block_receipts_root` is not computed when recovering from db with
+        // fast_recover == false And we should force it to recompute
+        // without checking receipts when fast_recover == false
+        if self.get_receipts_root(epoch_hash).is_none() {
+            return false;
+        }
+        let mut epoch_receipts = Vec::new();
+        for h in epoch_block_hashes {
+            if let Some(r) =
+                self.block_results_by_hash_with_epoch(h, epoch_hash, true)
+            {
+                epoch_receipts.push(r.receipts);
+            } else {
+                return false;
+            }
+        }
+
+        // Recover tx address if we will skip pivot chain execution
+        if on_local_pivot && self.record_tx_address {
+            for (block_idx, block_hash) in epoch_block_hashes.iter().enumerate()
+            {
+                let block =
+                    self.block_by_hash(block_hash, true).expect("block exists");
+                for (tx_idx, tx) in block.transactions.iter().enumerate() {
+                    if epoch_receipts[block_idx]
+                        .get(tx_idx)
+                        .unwrap()
+                        .outcome_status
+                        == TRANSACTION_OUTCOME_SUCCESS
+                    {
+                        self.insert_transaction_address_to_kv(
+                            &tx.hash,
+                            &TransactionAddress {
+                                block_hash: *block_hash,
+                                index: tx_idx,
+                            },
+                        )
+                    }
+                }
+            }
+        }
+        true
     }
 }
 

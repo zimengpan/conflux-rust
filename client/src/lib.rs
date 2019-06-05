@@ -83,10 +83,10 @@ impl ClientHandle {
             self.ledger_db,
             self.blockgen,
             Box::new((
+                self.consensus,
                 self.debug_rpc_http_server,
                 self.rpc_tcp_server,
                 self.rpc_http_server,
-                self.consensus,
                 self.txpool,
                 self.sync,
                 self.txgen,
@@ -105,6 +105,14 @@ impl Client {
         conf: Configuration, exit: Arc<(Mutex<bool>, Condvar)>,
     ) -> Result<ClientHandle, String> {
         info!("Working directory: {:?}", std::env::current_dir());
+
+        if conf.raw_conf.metrics_enabled {
+            metrics::enable();
+            metrics::report_file(
+                Duration::from_millis(conf.raw_conf.metrics_report_interval_ms),
+                conf.raw_conf.metrics_output_file.clone(),
+            );
+        }
 
         let worker_thread_pool = Arc::new(Mutex::new(ThreadPool::with_name(
             "Tx Recover".into(),
@@ -185,6 +193,7 @@ impl Client {
         let vm = VmFactory::new(1024 * 32);
         let pow_config = conf.pow_config();
         let consensus = Arc::new(ConsensusGraph::with_genesis_block(
+            conf.consensus_config(),
             genesis_block,
             storage_manager.clone(),
             vm.clone(),

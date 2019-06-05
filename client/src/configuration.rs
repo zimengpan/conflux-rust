@@ -4,27 +4,28 @@
 
 use blockgen::BlockGeneratorConfig;
 use cfxcore::{
+    consensus::ConsensusConfig,
     storage::{self, state_manager::StorageConfiguration},
     sync::ProtocolConfiguration,
 };
 use txgen::TransactionGeneratorConfig;
-/// usage:
-/// ```
-/// build_config! {
-///     {
-///         (name, (type), default_value)
-///         ...
-///     }
-///     {
-///         (name, (type), default_value, converter)
-///     }
-/// }
-/// ```
-/// `converter` is a function used to convert a provided String to `Result<type,
-/// String>`. For each entry, field `name` of type `type` will be created in
-/// `RawConfiguration`, and it will be assigned to the value passed through
-/// commandline argument or configuration file. Commandline argument will
-/// override the configuration file if the parameter is given in both.
+// usage:
+// ```
+// build_config! {
+//     {
+//         (name, (type), default_value)
+//         ...
+//     }
+//     {
+//         (name, (type), default_value, converter)
+//     }
+// }
+// ```
+// `converter` is a function used to convert a provided String to `Result<type,
+// String>`. For each entry, field `name` of type `type` will be created in
+// `RawConfiguration`, and it will be assigned to the value passed through
+// commandline argument or configuration file. Commandline argument will
+// override the configuration file if the parameter is given in both.
 build_config! {
     {
         (port, (Option<u16>), Some(32323))
@@ -55,20 +56,23 @@ build_config! {
         (db_compaction_profile, (Option<String>), None)
         (db_dir, (Option<String>), Some("./blockchain_db".to_string()))
         (generate_tx, (bool), false)
-        (generate_tx_period_ms, (Option<u64>), Some(100))
+        (generate_tx_period_us, (Option<u64>), Some(100_000))
         (storage_cache_start_size, (u32), storage::defaults::DEFAULT_CACHE_START_SIZE)
         (storage_cache_size, (u32), storage::defaults::DEFAULT_CACHE_SIZE)
         (storage_recent_lfu_factor, (f64), storage::defaults::DEFAULT_RECENT_LFU_FACTOR)
         (storage_idle_size, (u32), storage::defaults::DEFAULT_IDLE_SIZE)
         (storage_node_map_size, (u32), storage::defaults::MAX_CACHED_TRIE_NODES_R_LFU_COUNTER)
         (send_tx_period_ms, (u64), 1300)
-        (check_request_period_ms, (u64), 5000)
+        (check_request_period_ms, (u64), 1000)
         (block_cache_gc_period_ms, (u64), 5000)
         (persist_terminal_period_ms, (u64), 60_000)
         (headers_request_timeout_ms, (u64), 30_000)
         (blocks_request_timeout_ms, (u64), 120_000)
+        (transaction_request_timeout_ms, (u64), 30_000)
+        (tx_maintained_for_peer_timeout_ms, (u64), 600_000)
         (max_inflight_request_count, (u64), 32)
         (start_as_catch_up_mode, (bool), false)
+        (received_tx_index_maintain_timeout_ms, (u64), 600_000)
         (max_trans_count_received_in_catch_up, (u64), 60_000)
         (request_block_with_public, (bool), false)
         (load_test_chain, (Option<String>), None)
@@ -83,6 +87,13 @@ build_config! {
         (data_propagate_enabled, (bool), false)
         (data_propagate_interval_ms, (u64), 1000)
         (data_propagate_size, (usize), 1000)
+        (record_tx_address, (bool), true)
+        // TODO Set default to true when we have new tx pool implementation
+        (enable_optimistic_execution, (bool), false)
+        (debug_dump_dir_invalid_state_root, (String), "./invalid_state_root/".to_string())
+        (metrics_enabled, (bool), false)
+        (metrics_report_interval_ms, (u64), 5000)
+        (metrics_output_file, (String), "metrics.log".to_string())
     }
     {
         (
@@ -205,6 +216,20 @@ impl Configuration {
         )
     }
 
+    pub fn consensus_config(&self) -> ConsensusConfig {
+        ConsensusConfig {
+            debug_dump_dir_invalid_state_root: self
+                .raw_conf
+                .debug_dump_dir_invalid_state_root
+                .clone(),
+            record_tx_address: self.raw_conf.record_tx_address,
+            enable_optimistic_execution: self
+                .raw_conf
+                .enable_optimistic_execution,
+            bench_mode: false,
+        }
+    }
+
     pub fn pow_config(&self) -> ProofOfWorkConfig {
         ProofOfWorkConfig::new(
             self.raw_conf.test_mode,
@@ -219,7 +244,7 @@ impl Configuration {
     pub fn tx_gen_config(&self) -> TransactionGeneratorConfig {
         TransactionGeneratorConfig::new(
             self.raw_conf.generate_tx,
-            self.raw_conf.generate_tx_period_ms.expect("has default"),
+            self.raw_conf.generate_tx_period_us.expect("has default"),
         )
     }
 
@@ -253,11 +278,20 @@ impl Configuration {
             blocks_request_timeout: Duration::from_millis(
                 self.raw_conf.blocks_request_timeout_ms,
             ),
+            transaction_request_timeout: Duration::from_millis(
+                self.raw_conf.transaction_request_timeout_ms,
+            ),
+            tx_maintained_for_peer_timeout: Duration::from_millis(
+                self.raw_conf.tx_maintained_for_peer_timeout_ms,
+            ),
             max_inflight_request_count: self
                 .raw_conf
                 .max_inflight_request_count,
             request_block_with_public: self.raw_conf.request_block_with_public,
             start_as_catch_up_mode: self.raw_conf.start_as_catch_up_mode,
+            received_tx_index_maintain_timeout: Duration::from_millis(
+                self.raw_conf.received_tx_index_maintain_timeout_ms,
+            ),
             max_trans_count_received_in_catch_up: self
                 .raw_conf
                 .max_trans_count_received_in_catch_up,

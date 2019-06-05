@@ -19,7 +19,7 @@ use crate::{
 use cfx_types::{H256, U256, U512};
 use heapsize::HeapSizeOf;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
-use primitives::{block::CompactBlock, Block, BlockHeader};
+use primitives::{block::CompactBlock, Block, BlockHeader, EpochNumber};
 use rlp::Rlp;
 use slab::Slab;
 use std::{
@@ -402,19 +402,6 @@ impl SynchronizationGraphInner {
         Ok(is_heavy_block)
     }
 
-    /// The input `my_hash` must have been inserted to sync_graph, otherwise
-    /// it'll panic.
-    pub fn total_difficulty_in_own_epoch(&self, my_hash: &H256) -> U256 {
-        let my_index = *self.indices.get(my_hash).expect("exist");
-        self.arena[my_index]
-            .blockset_in_own_view_of_epoch
-            .iter()
-            .fold(
-                self.arena[my_index].block_header.difficulty().clone(),
-                |acc, x| acc + *self.arena[*x].block_header.difficulty(),
-            )
-    }
-
     /// The input `cur_hash` must have been inserted to sync_graph, otherwise
     /// it'll panic.
     pub fn target_difficulty(&self, cur_hash: &H256) -> U256 {
@@ -502,7 +489,6 @@ pub struct SynchronizationGraph {
     pub consensus: SharedConsensusGraph,
     pub data_man: Arc<BlockDataManager>,
     pub compact_blocks: RwLock<HashMap<H256, CompactBlock>>,
-    genesis_block_hash: H256,
     pub initial_missed_block_hashes: Mutex<HashSet<H256>>,
     pub verification_config: VerificationConfig,
     pub cache_man: Arc<Mutex<CacheManager<CacheId>>>,
@@ -521,16 +507,11 @@ impl SynchronizationGraph {
         fast_recover: bool,
     ) -> Self
     {
-        let genesis_block_hash = consensus.genesis_block().hash();
         let data_man = consensus.data_man.clone();
-        let genesis_block_header = data_man
-            .block_header_by_hash(&genesis_block_hash)
-            .expect("genesis exists")
-            .clone();
         let (consensus_sender, consensus_receiver) = mpsc::channel();
         let inner = Arc::new(RwLock::new(
             SynchronizationGraphInner::with_genesis_block(
-                genesis_block_header,
+                Arc::new(data_man.genesis_block().block_header.clone()),
                 pow_config,
             ),
         ));
@@ -538,7 +519,6 @@ impl SynchronizationGraph {
             inner: inner.clone(),
             data_man: data_man.clone(),
             compact_blocks: RwLock::new(HashMap::new()),
-            genesis_block_hash,
             initial_missed_block_hashes: Mutex::new(HashSet::new()),
             verification_config,
             cache_man: data_man.cache_man.clone(),
@@ -592,14 +572,17 @@ impl SynchronizationGraph {
         let mut missed_hashes = self.initial_missed_block_hashes.lock();
         let mut visited_blocks: HashSet<H256> = HashSet::new();
         while let Some(hash) = queue.pop_front() {
-            if hash == self.genesis_block_hash {
+            if hash == self.data_man.genesis_block().hash() {
                 continue;
             }
 
             if let Some(mut block) = self.block_by_hash_from_db(&hash) {
                 // This is for constructing synchronization graph.
-                let res =
-                    self.insert_block_header(&mut block.block_header, true);
+                let res = self.insert_block_header(
+                    &mut block.block_header,
+                    true,
+                    false,
+                );
                 assert!(res.0);
 
                 let parent = block.block_header.parent_hash().clone();
@@ -659,14 +642,17 @@ impl SynchronizationGraph {
 
         let mut missed_hashes = self.initial_missed_block_hashes.lock();
         while let Some(hash) = queue.pop_front() {
-            if hash == self.genesis_block_hash {
+            if hash == self.data_man.genesis_block().hash() {
                 continue;
             }
 
             if let Some(mut block) = self.block_by_hash_from_db(&hash) {
                 // This is for constructing synchronization graph.
-                let res =
-                    self.insert_block_header(&mut block.block_header, true);
+                let res = self.insert_block_header(
+                    &mut block.block_header,
+                    true,
+                    false,
+                );
                 assert!(res.0);
 
                 let parent = block.block_header.parent_hash().clone();
@@ -700,7 +686,7 @@ impl SynchronizationGraph {
 
         debug!("Initial missed blocks {:?}", *missed_hashes);
         info!("Finish reading {} blocks from db, start to reconstruct the pivot chain and the state", visited_blocks.len());
-        self.consensus.construct_pivot(&*self.inner.read());
+        self.consensus.construct_pivot(&self.inner);
         info!("Finish reconstructing the pivot chain of length {}, start to sync from peers", self.consensus.best_epoch_number());
     }
 
@@ -748,7 +734,7 @@ impl SynchronizationGraph {
         })
     }
 
-    pub fn genesis_hash(&self) -> &H256 { &self.genesis_block_hash }
+    pub fn genesis_hash(&self) -> H256 { self.data_man.genesis_block().hash() }
 
     pub fn contains_block_header(&self, hash: &H256) -> bool {
         self.inner.read().indices.contains_key(hash)
@@ -858,7 +844,7 @@ impl SynchronizationGraph {
     }
 
     pub fn insert_block_header(
-        &self, header: &mut BlockHeader, need_to_verify: bool,
+        &self, header: &mut BlockHeader, need_to_verify: bool, bench_mode: bool,
     ) -> (bool, Vec<H256>) {
         let mut inner = self.inner.write();
         let hash = header.hash();
@@ -883,9 +869,11 @@ impl SynchronizationGraph {
                     .verify_header_params(header)
                     .is_err())
         } else {
-            self.verification_config
-                .verify_pow(header)
-                .expect("local mined block should pass this check!");
+            if !bench_mode {
+                self.verification_config
+                    .verify_pow(header)
+                    .expect("local mined block should pass this check!");
+            }
             true
         };
 
@@ -1143,17 +1131,25 @@ impl SynchronizationGraph {
         BestInformation,
     > {
         let consensus_inner = self.consensus.inner.upgradable_read();
+        let (deferred_state_root, deferred_receipts_root) = self
+            .consensus
+            .wait_for_block_state(&consensus_inner.best_state_block_hash());
         let value = BestInformation {
             best_block_hash: consensus_inner.best_block_hash(),
             best_epoch_number: consensus_inner.best_epoch_number(),
             current_difficulty: consensus_inner.current_difficulty,
             terminal_block_hashes: consensus_inner.terminal_hashes(),
-            deferred_state_root: consensus_inner
-                .deferred_state_root_following_best_block(),
-            deferred_receipts_root: consensus_inner
-                .deferred_receipts_root_following_best_block(),
+            deferred_state_root,
+            deferred_receipts_root,
         };
         GuardedValue::new(consensus_inner, value)
+    }
+
+    pub fn get_block_hashes_by_epoch(
+        &self, epoch_number: u64,
+    ) -> Result<Vec<H256>, String> {
+        self.consensus
+            .get_block_hashes_by_epoch(EpochNumber::Number(epoch_number.into()))
     }
 
     pub fn verified_invalid(&self, hash: &H256) -> bool {
@@ -1166,17 +1162,17 @@ impl SynchronizationGraph {
         let blocks = self.data_man.blocks.read().heap_size_of_children();
         let block_receipts =
             self.data_man.block_receipts.read().heap_size_of_children();
-        let transaction_addresses = self
+        let transaction_addresses_data = self
             .data_man
             .transaction_addresses
             .read()
-            .heap_size_of_children()
-            + self
-                .consensus
-                .txpool
-                .unexecuted_transaction_addresses
-                .lock()
-                .heap_size_of_children();
+            .heap_size_of_children();
+        let transaction_addresses_unexecuted = self
+            .consensus
+            .txpool
+            .unexecuted_transaction_addresses
+            .lock()
+            .heap_size_of_children();
         let transaction_pubkey = self
             .consensus
             .txpool
@@ -1186,7 +1182,8 @@ impl SynchronizationGraph {
         CacheSize {
             blocks,
             block_receipts,
-            transaction_addresses,
+            transaction_addresses: transaction_addresses_data
+                + transaction_addresses_unexecuted,
             compact_blocks,
             transaction_pubkey,
         }
@@ -1198,7 +1195,6 @@ impl SynchronizationGraph {
         let current_size = self.cache_size().total();
         let mut blocks = self.data_man.blocks.write();
         let mut executed_results = self.data_man.block_receipts.write();
-        let mut tx_address = self.data_man.transaction_addresses.write();
         let mut compact_blocks = self.compact_blocks.write();
         let mut transaction_pubkey_cache =
             self.consensus.txpool.transaction_pubkey_cache.write();
@@ -1207,6 +1203,7 @@ impl SynchronizationGraph {
             .txpool
             .unexecuted_transaction_addresses
             .lock();
+        let mut tx_address = self.data_man.transaction_addresses.write();
         let mut cache_man = self.cache_man.lock();
         info!(
             "Before gc cache_size={} {} {} {} {} {} {}",
@@ -1259,8 +1256,10 @@ impl SynchronizationGraph {
         });
     }
 
-    // Manage statistics
+    /// Get the current number of blocks in the synchronization graph
+    pub fn block_count(&self) -> usize { self.data_man.blocks.read().len() }
 
+    // Manage statistics
     pub fn stat_inc_inserted_count(&self) {
         let mut inner = self.statistics.inner.write();
         inner.sync_graph.inserted_block_count += 1;

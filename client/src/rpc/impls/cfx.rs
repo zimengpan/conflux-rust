@@ -289,7 +289,7 @@ impl RpcImpl {
             .and_then(|tx| {
                 let result = self.tx_pool.insert_new_transactions(
                     self.consensus.best_state_block_hash(),
-                    vec![tx],
+                    &vec![tx],
                 );
                 if result.is_empty() || result.len() > 1 {
                     error!("insert_new_transactions failed, invalid length of returned result vector {}", result.len());
@@ -361,14 +361,19 @@ impl RpcImpl {
 
     fn generate_fixed_block(
         &self, parent_hash: H256, referee: Vec<H256>, num_txs: usize,
-    ) -> RpcResult<H256> {
+        difficulty: u64,
+    ) -> RpcResult<H256>
+    {
         info!(
-            "RPC Request: generate_fixed_block({:?}, {:?}, {:?})",
-            parent_hash, referee, num_txs
+            "RPC Request: generate_fixed_block({:?}, {:?}, {:?}, {:?})",
+            parent_hash, referee, num_txs, difficulty
         );
-        let hash =
-            self.block_gen
-                .generate_fixed_block(parent_hash, referee, num_txs);
+        let hash = self.block_gen.generate_fixed_block(
+            parent_hash,
+            referee,
+            num_txs,
+            difficulty,
+        );
         Ok(hash)
     }
 
@@ -543,7 +548,7 @@ impl RpcImpl {
         trace!("call tx {:?}", signed_tx);
         self.consensus
             .call_virtual(&signed_tx, epoch)
-            .map(|output| Bytes::new(output))
+            .map(|output| Bytes::new(output.0))
             .map_err(|e| RpcError::invalid_params(e))
     }
 
@@ -783,9 +788,15 @@ impl TestRpc for TestRpcImpl {
 
     fn generate_fixed_block(
         &self, parent_hash: H256, referee: Vec<H256>, num_txs: usize,
-    ) -> RpcResult<H256> {
-        self.rpc_impl
-            .generate_fixed_block(parent_hash, referee, num_txs)
+        difficulty: Trailing<u64>,
+    ) -> RpcResult<H256>
+    {
+        self.rpc_impl.generate_fixed_block(
+            parent_hash,
+            referee,
+            num_txs,
+            difficulty.unwrap_or(0),
+        )
     }
 
     fn generate_one_block(

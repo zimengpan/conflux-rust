@@ -5,11 +5,14 @@
 use crate::{Error, ErrorKind, ThrottlingReason};
 use byte_unit::n_mb_bytes;
 use lazy_static::lazy_static;
+use metrics::Gauge;
 use parking_lot::RwLock;
 
 lazy_static! {
     pub static ref THROTTLING_SERVICE: RwLock<Service> =
         RwLock::new(Service::new());
+    static ref QUEUE_SIZE_GAUGE: Gauge =
+        Gauge::register("network_throttling_queue_size");
 }
 
 #[derive(Debug)]
@@ -44,13 +47,18 @@ impl Service {
         let mb = n_mb_bytes!(1) as usize;
         assert!(std::usize::MAX / mb >= cap_mb);
 
-        // ensure the currenet queue size will not exceed the capacity.
+        // ensure the current queue size will not exceed the capacity.
         let cap = cap_mb * mb;
         assert!(self.cur_queue_size <= cap);
 
         self.queue_capacity = cap;
         self.min_throttle_queue_size = min_throttle_mb * mb;
         self.max_throttle_queue_size = max_throttle_mb * mb;
+
+        info!(
+            "throttling.initialize: min = {}M, max = {}M, cap = {}M",
+            min_throttle_mb, max_throttle_mb, cap_mb
+        );
     }
 
     pub(crate) fn on_enqueue(
@@ -72,6 +80,8 @@ impl Service {
             self.cur_queue_size
         );
 
+        QUEUE_SIZE_GAUGE.update(self.cur_queue_size as i64);
+
         Ok(self.cur_queue_size)
     }
 
@@ -87,6 +97,8 @@ impl Service {
             "throttling.on_dequeue: queue size = {}",
             self.cur_queue_size
         );
+
+        QUEUE_SIZE_GAUGE.update(self.cur_queue_size as i64);
 
         self.cur_queue_size
     }

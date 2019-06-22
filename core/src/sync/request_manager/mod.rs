@@ -11,6 +11,7 @@ use message::{
     GetBlockHashesByEpoch, GetBlockHeaders, GetBlockTxn, GetBlocks,
     GetCompactBlocks, GetTransactions, TransIndex,
 };
+use metrics::Gauge;
 use network::{NetworkContext, PeerId};
 use parking_lot::{Mutex, RwLock};
 use primitives::{SignedTransaction, TransactionWithSignature, TxPropagateId};
@@ -26,8 +27,11 @@ use std::{
 use tx_handler::{ReceivedTransactionContainer, SentTransactionContainer};
 
 mod request_handler;
-mod tx_handler;
+pub mod tx_handler;
 
+lazy_static! {
+    static ref TX_REQUEST_GAUGE: Gauge = Gauge::register("tx_diff_set_size");
+}
 #[derive(Debug, Eq, PartialEq, PartialOrd, Ord)]
 enum WaitingRequest {
     Header(H256),
@@ -63,7 +67,7 @@ pub struct RequestManager {
     /// Holds a set of transactions recently sent to this peer to avoid
     /// spamming.
     sent_transactions: RwLock<SentTransactionContainer>,
-    received_transactions: RwLock<ReceivedTransactionContainer>,
+    pub received_transactions: Arc<RwLock<ReceivedTransactionContainer>>,
 
     /// This is used to handle request_id matching
     request_handler: Arc<RequestHandler>,
@@ -82,11 +86,11 @@ impl RequestManager {
             protocol_config.tx_maintained_for_peer_timeout.as_millis()
                 / protocol_config.send_tx_period.as_millis();
         Self {
-            received_transactions: RwLock::new(
+            received_transactions: Arc::new(RwLock::new(
                 ReceivedTransactionContainer::new(
                     received_tx_index_maintain_timeout.as_secs(),
                 ),
-            ),
+            )),
             inflight_requested_transactions: Default::default(),
             sent_transactions: RwLock::new(SentTransactionContainer::new(
                 sent_transaction_window_size as usize,
@@ -361,7 +365,7 @@ impl RequestManager {
                     continue;
                 }
 
-                if received_transactions.contains(tx_id) {
+                if received_transactions.contains_txid(tx_id) {
                     // Already received
                     continue;
                 }
@@ -373,6 +377,8 @@ impl RequestManager {
 
             (indices, tx_ids)
         };
+        TX_REQUEST_GAUGE.update(tx_ids.len() as i64);
+        debug!("Request {} tx from peer={}", tx_ids.len(), peer_id);
         if let Err(e) = self.request_handler.send_request(
             io,
             peer_id,
@@ -693,10 +699,12 @@ impl RequestManager {
             .append_transactions(transactions)
     }
 
-    pub fn append_received_transaction_ids(&self, tx_ids: Vec<TxPropagateId>) {
+    pub fn append_received_transactions(
+        &self, transactions: Vec<Arc<SignedTransaction>>,
+    ) {
         self.received_transactions
             .write()
-            .append_transaction_ids(tx_ids)
+            .append_transactions(transactions)
     }
 
     pub fn resend_timeout_requests(&self, io: &NetworkContext) {
